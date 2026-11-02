@@ -2,8 +2,8 @@
 # Docker Desktop host networking and macOS/Windows are not verified.
 services:
   dashboard:
-    build: .
-    image: doubao-automation:preview
+    image: ghcr.io/willzhang35929924-ui/doubao_automation:preview
+    pull_policy: always
     network_mode: host
     environment:
       DOUBAO_DATA_DIR: /data
