@@ -1,0 +1,15 @@
+# Allow only the reviewed files needed by the preview image.
+**
+!Dockerfile
+!requirements.txt
+!dashboard.py
+!dashboard_ui.js
+!run_pipeline.py
+!run_login.py
+!run_postprocess.py
+!doubao_automation/
+!doubao_automation/*.py
+!scripts/
+!scripts/clear_history.py
+!config/
+!config/config.example.yaml

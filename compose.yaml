@@ -1,0 +1,22 @@
+# Linux host-network preview. Flask itself remains bound to 127.0.0.1:8782.
+# Docker Desktop host networking and macOS/Windows are not verified.
+services:
+  dashboard:
+    build: .
+    image: doubao-automation:preview
+    network_mode: host
+    environment:
+      DOUBAO_DATA_DIR: /data
+      DOUBAO_CONTAINER_PREVIEW: "1"
+      DOUBAO_COMFY_URL: ${DOUBAO_COMFY_URL:-}
+    volumes:
+      - doubao_data:/data
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  doubao_data:

@@ -1,0 +1,33 @@
+# Template only. Copy to your private user-data directory; never publish real settings.
+browser:
+  headless: false
+  start_maximized: true
+accounts:
+  doubao: []
+  gemini: {}
+feishu:
+  app_id: ""
+  app_secret: ""
+  app_token: ""
+  products_table:
+    table_id: ""
+    keyword_field: "keyword"
+    image_field: "产品图"
+  scripts_table:
+    table_id: ""
+    keyword_field: "keyword"
+    prompt_field: "提示词"
+    video_field: "视频"
+login: {}
+doubao:
+  # Built-in conservative daily video quota patterns are used when this key is absent.
+  # To replace them with platform messages you have personally verified, supply
+  # quota_exhausted_patterns as a list of Python regular expressions. An empty
+  # list disables text-based exhaustion detection. Never place credentials here.
+  selectors:
+    # Optional: quota_balance should select only the verified live video balance UI.
+    # quota_balance: 'selector-for-verified-balance-element'
+    input_box:
+      - 'div[contenteditable="true"]'
+video:
+  aspect_ratio: '9:16'

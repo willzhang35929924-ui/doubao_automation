@@ -1,0 +1,111 @@
+# Python 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+**/.venv/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 本地任务数据和运行记录
+.tmp/
+logs/
+profiles/
+workspace/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# 本地密钥和配置
+.env
+.env.*
+!.env.example
+/config/config.yaml
+/config/gemini_prompt.txt
+/postprocess_setup/seedvr_config.json
+
+# Runtime media, models, browser state and bundled native tools
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.ckpt
+*.bin
+*.gguf
+*.pdiparams
+*.pdmodel
+*.exe
+*.dll
+*.dylib
+*.so
+*.so.*
+*.sqlite-wal
+*.sqlite-shm
+*.jsonl
+*.tmp
+*.part
+*.part[0-9]*
+*.zip.part*
+**/ffmpeg
+**/ffprobe
+**/ffmpeg.exe
+**/ffprobe.exe
+**/ffmpeg*.part*
+**/ffprobe*.part*
+**/model_manifest.json
+**/models/**/manifest.json
+**/models--*/
+**/ms-playwright/
+**/playwright/.local-browsers/
+**/browser-profile*/
+**/cookies.json
+**/storage_state.json
+**/node_modules/
+**/.cache/
+**/.uv_cache/
+**/.runtime_cache/
+/postprocess_setup/vsr_ready.json
+/postprocess_setup/seedvr_*.json
+
+# 第三方依赖缓存和本地环境
+/third_party/video-subtitle-remover/.uv_cache/
+/third_party/video-subtitle-remover/.runtime_cache/
+/third_party/video-subtitle-remover/.condarc
+
+# Python 安装临时目录
+pip-build-tracker-*/
+pip-ephem-wheel-cache-*/
+pip-install-*/
+pip-metadata-*/
+pip-unpack-*/
+pip-wheel-*/
+
+# 系统和构建文件
+Thumbs.db
+.DS_Store
+build/
+dist/
+*.egg-info/
+
+# 第三方模型权重：不上传 GitHub，安装时单独获取
+/third_party/video-subtitle-remover/backend/models/**/*.pt
+/third_party/video-subtitle-remover/backend/models/**/*.pth
+/third_party/video-subtitle-remover/backend/models/**/*.pdiparams
+/third_party/video-subtitle-remover/backend/models/**/*.onnx
+
+# RapidOCR 模型权重
+/third_party/video-subtitle-remover/vendor/**/*.onnx
+
+# 第三方项目自带的测试媒体和演示动画
+/third_party/video-subtitle-remover/test/*.mp4
+/third_party/video-subtitle-remover/design/*.gif

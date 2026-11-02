@@ -1,0 +1,136 @@
+# 豆包多账号视频生成自动化
+
+项目目标是在多个独立浏览器配置中完成：**脚本文案 + 产品图片 → 豆包生成视频**，
+以下为设计流程；发布副本的第三方后处理依赖尚未纳入，macOS 需实机验证：
+
+```
+飞书多维表格                     Gemini 网页版                  豆包账号池
+┌─────────────────┐   视频+提示词+固定指令   ┌────────────┐   每个脚本(切分为≤15s多段)   ┌──────────────┐
+│ 产品图表: 产品图  │ ────────────────────► │ 生成多个脚本 │ ─────────────────────────► │ 对话框输入文案 │
+│ 提示词表: 提示词/视频│      (浏览器自动化)    └────────────┘   首段: 产品图             │ + 上传图片     │
+└─────────────────┘                                    后续段: 上一段尾帧作首帧 ──────► │ 生成并下载视频 │
+      (飞书 OpenAPI)                                                                    └──────────────┘
+                                                       确认额度耗尽 → 尝试下一个可用账号
+```
+
+## 关键机制
+
+长视频与额度规则的设计见 [长视频生成与账号额度规则](docs/long_video_rules.md)：每段最多15秒、每批最多2条；本地账本按配置的每日额度跟踪已用、预留和未决记录。实际豆包页面、额度和响应格式可能变化，自动识别与账号切换尚需实机核验。
+
+- **15 秒限制**：脚本按中文口播语速（默认 4.5 字/秒）估算时长，超过 `video.target_segment_seconds`
+  （默认 13 秒，留缓冲）就自动切成多段并改写每段文案（`doubao_automation/script_splitter.py`）。
+- **首尾帧无缝衔接**：
+  1. 每段发给豆包的提示词都显式写明「首帧画面 = 上一段尾帧画面」的定格描述（文字层面锁死光线/机位/产品位置）；
+  2. 上一段视频下载后立刻用 ffmpeg 提取**真实尾帧**，作为下一段上传的第一张图，并要求豆包「以该图为首帧」；
+  3. 流水线会尝试对满足条件的分段进行合成；`video.auto_concat` 不是当前代码读取的开关，不能用它控制合成。
+- **多账号与额度切换**：账号由使用者在本机配置或工作台添加并人工登录，不固定数量。明确识别额度耗尽时会尝试启用账号中的下一个；网络、登录、验证等含糊提示不会判为耗尽。`doubao.quota_exhausted_patterns` 可按真实页面提示调整，空列表禁用文本识别；余额元素需用户校准 `doubao.selectors.quota_balance`。默认中英文模板尚未获得真实平台样本验证，无可用账号或结果不明确时保留任务状态，不保证自动续跑成功。
+- **断点续跑**：所有任务状态持久化在 `workspace/state/pipeline_state.json`，中断后重跑 `run` 自动续接。
+- **登录问题**：检测到登录失效时暂停该账号并提示；随时可重跑 `python run_login.py` 弹窗人工登录。
+
+## 目录结构
+
+```
+├── run_login.py            # 按本机配置打开登录窗口
+├── run_pipeline.py         # 流水线入口（fetch/scripts/plan/run/status/inspect-*/concat）
+├── config/config.example.yaml # 无敏感数据的配置模板；私有配置由用户自行创建
+├── docs/macos.md           # macOS 安装与待验证事项
+├── doubao_automation/            # 各模块（浏览器池/飞书/Gemini/切分/豆包代理/编排）
+├── profiles/               # Windows 运行时数据；macOS 存放在用户数据目录
+└── workspace/              # Windows 运行时数据；macOS 存放在用户数据目录
+```
+
+## 平台入口
+
+- **Windows**：安装 Python、将完整 FFmpeg（含 FFprobe）加入 PATH，创建 `.venv` 并安装依赖，然后双击 `scripts/start_windows.bat`。登录状态和任务数据使用 Windows 本机数据目录。
+- **macOS（Apple Silicon）**：参见 [macOS 安装与启动指南](docs/macos.md)，双击 `scripts/start_macos.command`；需要可执行权限。数据默认位于当前用户的 Application Support 目录，不复制 Windows Profile。功能待 Mac 实机验证。
+- **关闭与历史清理**：`scripts/stop_windows.bat`、`scripts/stop_macos.command` 目前会明确提示安全关闭尚未支持，不终止进程。两个 `clear_history` 入口和工作台按钮目前仅提供保守预览，不删除记录或文件；需要先完成原子关停、引用核验和恢复机制才能支持实际操作。以上入口均尚未实测。
+- **Docker**：仅准备了尚未构建的 Linux 主机网络 Web/API 预览，见 [Docker 说明](docs/docker.md)；不包括浏览器和后处理能力。
+- **手动学习发布**：本副本位于外层项目仓库内，首次 Git 操作前请阅读 [GitHub 与 GHCR 指南](docs/publishing.md)，确认仓库根目录；不要在外层仓库误添加发布副本。
+- **Linux**：保留平台隔离设计，尚未提供经过验证的部署入口或 Docker 镜像。
+## 首次安装（在项目根目录执行）
+
+### 本地仪表盘
+
+双击 `start_dashboard.bat` 打开 `http://127.0.0.1:8782/`。重复打开会复用同一个常驻管理服务，固定地址为 8782。
+
+- “同步飞书”从远端读取素材；“保存修改”写入本地状态，不回写飞书。运行使用已保存素材，不会重新同步覆盖修改。
+- 脚本数量根据素材提示词及 Gemini 返回的脚本确定。操作消息与实时运行日志分别显示，失败时会显示未完成。
+- 已下载视频的“打开文件”在浏览器直接播放，支持拖动进度；“打开文件夹”请求 Windows 打开视频目录，按钮旁显示请求结果或系统错误。
+- 每行的“删除”经确认后会删除该行原始 MP4 的磁盘文件，列表随即移除该视频；排队或后处理中的视频暂不能删除。
+- 添加豆包账号后会打开独立浏览器，需要人工登录。新账号在登录验证成功前不会进入运行账号池；可关闭登录窗口后使用其他已登录账号运行。
+- 每次运行使用独立编号保存新视频，保留已有成片。运行日志保存在 `logs/r*.log`；启动故障查看 `logs/dashboard.log`。
+
+后台管理进程保存在 `dashboard_service.py`。它会监测仪表盘和 `doubao_automation/*.py` 的修改；由于尚无原子安全关停协议，检测到变更时只标记待重载，**不会自动结束或重载工作进程**。管理进程退出后，工作进程可能仍在运行，状态文件也可能过期；不能仅凭状态文件判断进程已退出。运行状态见 `.tmp/dashboard_service.json`，管理日志见 `logs/dashboard_service.log`。页面 JavaScript 修改通常需要刷新页面；以上行为尚未实测。
+
+Windows 桌面助手与 macOS Finder 操作是不同的平台路径：Windows 新启动入口可在默认数据目录下请求启动桌面助手；自定义数据目录时不会启动不匹配的助手。macOS 通过 Finder 请求显示文件，无法证明窗口已显示；两平台均需实机核验。
+
+### 审核后自动去水印与超分
+
+**本发布副本不包含 video-subtitle-remover、RapidOCR、后处理适配器或模型权重**，因此审核后的去水印与 SeedVR2 超分功能尚不能运行；未经 PATH-only FFmpeg 验证的第三方适配器会被拒绝，补装模型本身无法启用。ComfyUI 需由使用者独立部署，节点、模型和 GPU 兼容性仍需验证。Windows 原有代码路径予以保留；macOS 链路待实机验证。
+命令行使用工作台已保存素材：`python run_pipeline.py all --from-saved --force`。普通 `all --force` 仍会重新同步飞书。
+
+```powershell
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+# 使用系统 Chrome（推荐，无需下载浏览器）；若没有 Chrome 才需要:
+# python -m playwright install chromium
+```
+
+## 飞书应用配置（一次性）
+
+1. 打开 [飞书开放平台](https://open.feishu.cn/app) → 创建**自建应用**；
+2. 权限管理中开通：`bitable:app:readonly`（查看多维表格）、`drive:drive:readonly`（下载云空间文件）；
+3. 创建版本并**发布**（企业管理员审核通过后生效）；
+4. 在目标多维表格 Base 右上角「…」→ 添加文档应用 → 选择该应用（可阅读权限即可）；
+5. 把 App ID / App Secret 填入 `config/config.yaml` 的 `feishu.app_id` / `feishu.app_secret`；
+6. 若固定提示词指令存在飞书文档/表格，把 `feishu.fixed_prompt` 改为对应来源
+   （`bitable`: table_id+field+record_index；`docx`: document_id）。
+
+## 使用流程
+
+```powershell
+# ① 登录：按本机配置打开账号窗口，人工完成登录
+python run_login.py
+
+# ② 全流程：飞书下载 → Gemini 生成完整脚本 → 最长15秒分段 → 按账号余额依次生成
+python run_pipeline.py all
+
+# 分步执行 / 排查
+python run_pipeline.py fetch --force     # 重新拉飞书数据
+python run_pipeline.py scripts --limit 1 # 只用第 1 条源记录试跑 Gemini
+python run_pipeline.py plan              # 查看切分结果（生成任务）
+python run_pipeline.py run               # 执行/续跑
+python run_pipeline.py status            # 任务与账号状态
+python run_pipeline.py concat --script s0_1
+```
+
+产物位置：分段视频 `workspace/videos/`，尾帧 `workspace/frames/`，脚本 `workspace/scripts/`。
+
+## 页面选择器校准（豆包/Gemini 改版时）
+
+所有选择器都集中在 `config/config.yaml`，无需改代码。实机勘察：
+
+```powershell
+python run_pipeline.py inspect-doubao --account doubao1 --interactive
+python run_pipeline.py inspect-gemini
+```
+
+会把页面截图 + 可交互元素清单存到 `workspace/inspect/`，据此更新 config.yaml 即可。
+
+## 常见问题
+
+- **登录成功但脚本一直显示等待**：豆包会话 cookie 名称可能变化。直接按 Ctrl+C 结束 `run_login.py`
+  即可——登录态已经保存在 profile 里，不影响后续自动化；同时把 `login.doubao_logged_in_cookies`
+  补充实际 cookie 名（可在浏览器 F12 → Application → Cookies 查看）。
+- **提示「找不到对话输入框 / 上传入口」**：运行对应 inspect 命令校准选择器。
+- **某账号被标记 needs_login**：重跑 `python run_login.py --account doubao2` 登录后，
+  `python run_pipeline.py run` 自动续跑。
+- **额度跨天恢复**：耗尽账号次日自动回到可用池，无需手工干预。
+- **批次与额度**：当前按账号依次执行，每批最多两条、每账号每天最多四条；余额为零后切换已登录账号。
+  已提交但结果未知的请求只恢复原对话，不能通过重新登录补回次数。
+
+## 已知边界
+
+- 豆包/ Gemini 均为网页自动化，页面大改版时需要按上面方法校准选择器；
+- Gemini 网页版对上传视频大小有限制（以页面实际提示为准），超大视频请先压缩；
+- 豆包对同一账号的免费视频生成次数以官方为准，本工具只做「检测 + 切换」，不绕过任何限制。

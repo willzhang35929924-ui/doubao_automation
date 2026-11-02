@@ -1,0 +1,8 @@
+# Doubao multi-account video automation - dependencies
+# Install with the project virtual environment:
+#   Windows: .venv\Scripts\python.exe -m pip install -r requirements.txt
+#   macOS: .venv/bin/python -m pip install -r requirements.txt
+playwright>=1.44
+requests>=2.31
+PyYAML>=6.0
+Flask>=3.0
