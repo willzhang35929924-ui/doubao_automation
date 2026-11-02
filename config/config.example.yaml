@@ -9,6 +9,10 @@ feishu:
   app_id: ""
   app_secret: ""
   app_token: ""
+  # 本机需自行创建私有文件；不要将提示词或飞书密钥提交到 GitHub。
+  fixed_prompt:
+    source: file
+    file: config/gemini_prompt.txt
   products_table:
     table_id: ""
     keyword_field: "keyword"

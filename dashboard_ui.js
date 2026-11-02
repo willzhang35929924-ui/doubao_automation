@@ -94,7 +94,28 @@ async function saveRows(show = true) {
   dirty = false; if (show) msg('已保存 '+result.updated+' 条修改（运行时使用这些素材）');
   await refresh(); return result;
 }
-async function syncFeishu() { try { if (dirty) throw Error('请先保存本地修改，再同步飞书'); msg(await api('/api/sync',{})); await refresh(); } catch(e) { msg(e.message); } }
+let syncPending = false;
+async function syncFeishu() {
+  if (syncPending) return;
+  const button = document.querySelector('[onclick="syncFeishu()"]');
+  const status = document.querySelector('#sync-result');
+  const show = text => { if (status) status.textContent = text; msg(text); };
+  if (dirty) { show('请先保存本地修改，再同步飞书'); return; }
+  syncPending = true;
+  if (button) { button.disabled = true; button.textContent = '同步中…'; }
+  show('正在连接飞书并下载素材，请稍候…');
+  try {
+    const result = await api('/api/sync', {});
+    show(`同步完成：产品 ${result.products ?? 0} 条，素材 ${result.sources ?? 0} 条。`);
+    await refresh();
+  } catch(e) {
+    const detail = e.message === 'Failed to fetch' ? '无法连接工作台，请确认服务已启动' : e.message;
+    show('同步失败：' + detail);
+  } finally {
+    syncPending = false;
+    if (button) { button.disabled = false; button.textContent = '同步飞书'; }
+  }
+}
 async function upload() {
   const f = new FormData(); f.append('keyword',document.querySelector('#newkw').value); f.append('prompt',document.querySelector('#newprompt').value);
   for (const x of document.querySelector('#newvid').files) f.append('videos',x);

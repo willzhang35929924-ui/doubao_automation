@@ -78,13 +78,26 @@ python -m venv .venv
 
 ## 飞书应用配置（一次性）
 
+同步需要使用者自己的私有配置，下载源码后不会自动携带任何飞书账号、密钥或提示词。请勿把 `config/config.yaml`、固定提示词或 Cookie 上传到 GitHub。
+
+Windows 在项目目录下执行以下命令准备配置；如果文件已存在，请保留原文件并手动编辑，不要覆盖：
+
+```powershell
+if (-not (Test-Path config/config.yaml)) { Copy-Item config/config.example.yaml config/config.yaml }
+notepad config/config.yaml
+```
+
+macOS 使用用户数据目录，按 [macOS 配置说明](docs/macos.md) 创建配置。若设置了 `DOUBAO_DATA_DIR` 或 `DOUBAO_CONFIG_PATH`，请编辑该设置对应的本机配置，而不是修改示例文件。
+
 1. 打开 [飞书开放平台](https://open.feishu.cn/app) → 创建**自建应用**；
 2. 权限管理中开通：`bitable:app:readonly`（查看多维表格）、`drive:drive:readonly`（下载云空间文件）；
 3. 创建版本并**发布**（企业管理员审核通过后生效）；
 4. 在目标多维表格 Base 右上角「…」→ 添加文档应用 → 选择该应用（可阅读权限即可）；
-5. 把 App ID / App Secret 填入 `config/config.yaml` 的 `feishu.app_id` / `feishu.app_secret`；
-6. 若固定提示词指令存在飞书文档/表格，把 `feishu.fixed_prompt` 改为对应来源
+5. 在私有配置填写 `feishu.app_id`、`app_secret`、多维表格 Base 的 `app_token`，以及 `products_table.table_id` 和 `scripts_table.table_id`；表中的字段名也要与实际列名一致。两个表需要允许该应用读取；
+6. 默认固定提示词来自私有的 `config/gemini_prompt.txt`，请自行创建并填写。macOS 的相对路径位于应用数据目录；若存在飞书文档/表格，也可把 `feishu.fixed_prompt` 改为对应来源
    （`bitable`: table_id+field+record_index；`docx`: document_id）。
+
+点击“同步飞书”后，按钮旁会显示进行中、成功或失败原因。附件下载可能需要较长时间；如出现权限错误，请检查应用是否已发布、授权是否生效，以及 Base 是否已将应用加入协作者。同步失败不会自动补充私有配置。
 
 ## 使用流程
 

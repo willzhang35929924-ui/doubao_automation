@@ -37,6 +37,29 @@ class FeishuClient:
         if not self.app_token:
             raise FeishuError("缺少 feishu.app_token（多维表格链接 /base/ 后面那段）。")
 
+    def validate_sync_config(self):
+        """Check local prerequisites before requesting or downloading any data."""
+        for key, label in (("products_table", "产品图表"), ("scripts_table", "提示词/视频表")):
+            table = self.cfg.get(key) or {}
+            if not isinstance(table, dict) or not str(table.get("table_id") or "").strip():
+                raise FeishuError(f"未配置{label}的表格 ID：请填写 feishu.{key}.table_id。")
+        spec = self.cfg.get("fixed_prompt") or {}
+        if not isinstance(spec, dict):
+            raise FeishuError("飞书固定提示词配置格式错误：feishu.fixed_prompt 应为配置项。")
+        source = str(spec.get("source", "file"))
+        if source == "file":
+            p = resolve(spec.get("file", "config/gemini_prompt.txt"))
+            if not p.is_file():
+                raise FeishuError("未找到固定提示词文件。请在本机创建 config/gemini_prompt.txt，或配置 feishu.fixed_prompt 使用飞书表格/文档。")
+        elif source == "bitable":
+            if not str(spec.get("table_id") or "").strip():
+                raise FeishuError("固定提示词使用飞书表格时，请填写 feishu.fixed_prompt.table_id。")
+        elif source == "docx":
+            if not str(spec.get("document_id") or "").strip():
+                raise FeishuError("固定提示词使用飞书文档时，请填写 feishu.fixed_prompt.document_id。")
+        else:
+            raise FeishuError("未知的固定提示词来源，请使用 file、bitable 或 docx。")
+
     # ---- 认证 ----
     def token(self) -> str:
         if self._token and time.time() < self._token_expire - 60:
