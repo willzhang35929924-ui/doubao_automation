@@ -39,11 +39,13 @@ class FeishuError(Exception):
 _LOG = logging.getLogger(__name__)
 _ATTEMPTS = 3
 _RETRY_STATUSES = frozenset((429, 500, 502, 503, 504))
+_RETRY_API_CODES = frozenset((1254607,))  # Bitable data not ready / computation timeout.
+_RECORD_READ_ATTEMPTS = 5
 
 
 def _event(event, **fields):
     """Persist only explicitly selected diagnostic fields, never request data."""
-    allowed = ('operation', 'attempt', 'http_status', 'api_code', 'request_id', 'error_class')
+    allowed = ('operation', 'attempt', 'http_status', 'api_code', 'request_id', 'error_class', 'page_size')
     record = dict(time=time.strftime('%Y-%m-%d %H:%M:%S'), event=event,
                   **{key: fields[key] for key in allowed if key in fields})
     try:
@@ -92,21 +94,30 @@ class FeishuClient:
         value = response.headers.get('X-Tt-Logid') or response.headers.get('X-Request-Id') or ''
         return value if re.fullmatch(r'[A-Za-z0-9_-]{1,128}', str(value)) else None
 
-    def _response_error(self, operation, response, data=None):
+    @staticmethod
+    def _api_code(data):
         code = data.get('code') if isinstance(data, dict) else None
-        if not isinstance(code, int) and not (isinstance(code, str) and re.fullmatch(r'-?\d{1,16}', code)):
-            code = None
+        if isinstance(code, int) and not isinstance(code, bool):
+            return code
+        if isinstance(code, str) and re.fullmatch(r'-?\d{1,16}', code):
+            return int(code)
+        return None
+
+    def _response_error(self, operation, response, data=None):
+        code = self._api_code(data)
         request_id = self._request_id(response)
         parts = [f'{operation}失败', f'HTTP {response.status_code}']
         if code is not None:
             parts.append(f'飞书错误码 {code}')
         if request_id:
             parts.append(f'请求编号 {request_id}')
+        if code in _RETRY_API_CODES:
+            parts.append('飞书数据尚未就绪：前置操作可能仍在处理，或服务端计算超时；本次读取未完成')
         if operation == '下载附件' and response.status_code in (400, 403, 404):
             parts.append('请核对附件仍存在及应用的附件读取权限；多维表格高级权限需保留附件授权参数')
         error = FeishuError('；'.join(parts), operation=operation, http_status=response.status_code,
                             api_code=code, request_id=request_id,
-                            retryable=response.status_code in _RETRY_STATUSES)
+                            retryable=response.status_code in _RETRY_STATUSES or code in _RETRY_API_CODES)
         _event('response_error', operation=operation, http_status=response.status_code,
                api_code=code, request_id=request_id)
         return error
@@ -166,19 +177,25 @@ class FeishuClient:
                            retryable=cls._retryable_transport(exc, auth=auth))
 
     @staticmethod
-    def _retry_delay(attempt, response=None):
-        delay = min(0.5 * (2 ** (attempt - 1)), 2)
+    def _retry_delay(attempt, response=None, *, api_code=None):
+        delay = (min(2 ** (attempt - 1), 8) if api_code in _RETRY_API_CODES
+                 else min(0.5 * (2 ** (attempt - 1)), 2))
         if response is not None:
             value = response.headers.get('Retry-After', '')
             if str(value).isdigit():
                 delay = max(delay, min(float(value), 5))
         time.sleep(delay)
 
-    def _request(self, method, path, operation, *, auth=False, attempts=_ATTEMPTS, **kwargs):
+    def _request(self, method, path, operation, *, auth=False, attempts=_ATTEMPTS,
+                 json_response=False, record_page=None, **kwargs):
         """Bounded retries only for reads and this credential-retrieval POST."""
         kwargs.setdefault('timeout', (10, 45))
         # No redirect may forward a credential or token from this API host.
         kwargs.setdefault('allow_redirects', False)
+        if record_page is not None:
+            # The caller owns this page state, including its unchanged cursor.
+            # Give each physical request a snapshot for diagnostics and callers.
+            kwargs['params'] = dict(record_page)
         for attempt in range(1, attempts + 1):
             try:
                 response = self.session.request(method, self.base + path, **kwargs)
@@ -188,16 +205,28 @@ class FeishuClient:
                     self._retry_delay(attempt)
                     continue
                 raise self._transport_error(operation, exc, attempt, auth=auth) from None
-            if method == 'GET' and response.status_code in _RETRY_STATUSES and attempt < attempts:
+            api_code = None
+            if method == 'GET' and json_response and (response.status_code == 400
+                                                       or 200 <= response.status_code < 300):
+                try:
+                    api_code = self._api_code(response.json())
+                except ValueError:
+                    pass
+            retryable = response.status_code in _RETRY_STATUSES or api_code in _RETRY_API_CODES
+            if method == 'GET' and retryable and attempt < attempts:
+                if api_code in _RETRY_API_CODES and record_page is not None:
+                    record_page['page_size'] = max(1, int(record_page['page_size']) // 2)
+                    kwargs['params'] = dict(record_page)
                 _event('retry', operation=operation, attempt=attempt, http_status=response.status_code,
-                       request_id=self._request_id(response))
+                       api_code=api_code, request_id=self._request_id(response),
+                       page_size=record_page.get('page_size') if record_page is not None else None)
                 response.close()
-                self._retry_delay(attempt, response)
+                self._retry_delay(attempt, response, api_code=api_code)
                 continue
             return response
 
     def _json(self, method, path, operation, **kwargs):
-        with self._request(method, path, operation, **kwargs) as response:
+        with self._request(method, path, operation, json_response=True, **kwargs) as response:
             try:
                 data = response.json()
             except ValueError:
@@ -213,29 +242,6 @@ class FeishuClient:
             _event('success', operation=operation, http_status=response.status_code,
                    request_id=self._request_id(response))
             return data
-
-    def validate_sync_config(self):
-        """Check local prerequisites before requesting or downloading any data."""
-        for key, label in (("products_table", "产品图表"), ("scripts_table", "提示词/视频表")):
-            table = self.cfg.get(key) or {}
-            if not isinstance(table, dict) or not str(table.get("table_id") or "").strip():
-                raise FeishuError(f"未配置{label}的表格 ID：请填写 feishu.{key}.table_id。")
-        spec = self.cfg.get("fixed_prompt") or {}
-        if not isinstance(spec, dict):
-            raise FeishuError("飞书固定提示词配置格式错误：feishu.fixed_prompt 应为配置项。")
-        source = str(spec.get("source", "file"))
-        if source == "file":
-            p = resolve(spec.get("file", "config/gemini_prompt.txt"))
-            if not p.is_file():
-                raise FeishuError("未找到固定提示词文件。请在本机创建 config/gemini_prompt.txt，或配置 feishu.fixed_prompt 使用飞书表格/文档。")
-        elif source == "bitable":
-            if not str(spec.get("table_id") or "").strip():
-                raise FeishuError("固定提示词使用飞书表格时，请填写 feishu.fixed_prompt.table_id。")
-        elif source == "docx":
-            if not str(spec.get("document_id") or "").strip():
-                raise FeishuError("固定提示词使用飞书文档时，请填写 feishu.fixed_prompt.document_id。")
-        else:
-            raise FeishuError("未知的固定提示词来源，请使用 file、bitable 或 docx。")
 
     def validate_sync_config(self):
         """Check local prerequisites before requesting or downloading any data."""
@@ -288,7 +294,9 @@ class FeishuClient:
             data = self._json(
                 'GET', f"/open-apis/bitable/v1/apps/{quote(self.app_token, safe='')}/tables/{quote(table_id, safe='')}/records",
                 '读取多维表格记录', headers=self._headers(), params=params,
+                record_page=params, attempts=_RECORD_READ_ATTEMPTS,
             )
+            page_size = params['page_size']
             payload = data.get("data", {})
             records.extend(payload.get("items") or [])
             if not payload.get("has_more"):
