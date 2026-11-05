@@ -30,6 +30,55 @@ class GeminiSubmissionUncertain(GeminiError):
     """A send was attempted; automatic retries could duplicate an accepted request."""
 
 
+class GeminiResponseRejected(GeminiSubmissionUncertain):
+    """Invalid output is not replayable until complete-turn evidence confirms it."""
+
+    def __init__(self,*args):
+        super().__init__(*args)
+        self.can_retry_same_request=False
+
+
+class GeminiRefusalResponse(GeminiResponseRejected):
+    """An explicit completed refusal; only a specific caller policy may retry it."""
+
+
+def is_refusal_response(text):
+    """Recognize a standalone refusal without treating scripted dialogue as one."""
+    from .script_splitter import SCRIPT_HEADER_RE, TS_BLOCK_RE
+    text = (text or '').strip()
+    if SCRIPT_HEADER_RE.search(text) or TS_BLOCK_RE.search(text):
+        return False
+    if re.search(
+        r'^(?:(?:抱歉|请恕我爱莫能助)[，,。\s]*)?(?:由于[^。！？\n]{0,40}(?:局限|限制)[，,\s]*)?'
+        r'我(?:目前|暂时)?(?:没法|无法|不能)(?:办到|完成|帮助|满足|处理|生成|提供)', text):
+        return True
+    # Match a model describing its own inability, not any occurrence of a
+    # negative word in a positive response or a quoted example.
+    introduction=re.match(
+        r'^(?:(?:很?抱歉|对不起|请恕(?:我)?(?:爱莫能助)?)[，,。！？!\s]*)*'
+        r'(?:作为|身为|我(?:只是|是|作为|身为))\s*(?:一(?:个|种)\s*)?'
+        r'(?:(?:大(?:型)?)?语言模型|AI\s*(?:助手|模型)?|人工智能(?:助手|模型)?)(?:的我)?',
+        text,re.I)
+    if not introduction:
+        return False
+    clause=re.split(r'[。！？!?\n]',text[introduction.end():],1)[0].strip('，,；;：: ')
+    if re.match(r'^(?:我\s*)?(?:可以|能够|能|愿意|乐意|会)',clause):
+        return False
+    if re.search(r'(?:超出|不在|不属于)[^。！？\n]{0,12}(?:设计(?:用途|范围)|能力范围)',clause):
+        return True
+    refusal=re.search(
+        r'(?:^|[，,；;：:])\s*(?:(?:因此|所以|但|不过|很抱歉|抱歉|对不起)\s*)?'
+        r'(?:我\s*)?(?:(?:目前|暂时|确实|实在)\s*)?'
+        r'(?:(?:不能|无法|没(?:有)?办法|没法)(?P<bridge>[^，,；;。！？\n]{0,16}?)'
+        r'(?:提供|帮助|帮上忙|回复|理解|完成|办到)(?!的|时)'
+        r'|理解不了|爱莫能助(?:[，,；;\s]*$))',clause)
+    if not refusal:
+        return False
+    # An accuracy disclaimer or an inability to judge someone else's action is
+    # not a completed refusal to perform the requested work.
+    return not re.search(r'保证|确保|承诺|判断|确定|预测',refusal.group('bridge') or '')
+
+
 _PROMPT_EDITOR = '[contenteditable="true"][role="textbox"], textarea'
 _UPLOAD_OPENERS = [
     'button[aria-label="上传和工具"]',
@@ -100,6 +149,29 @@ def _requested_durations(message, requested_count=None):
                 count,seconds=repeated.pop()
                 if 0<count<=100 and requested_count in (None,count):return [seconds]*count
             return []
+        # Duration may follow a description of the requested product/script,
+        # not just the count: "写一个该产品功能场景应用的15秒...脚本".
+        # Keep it in the output-request clause and before its first script
+        # noun, so reference footage or a per-segment tool limit is not a total.
+        natural = []
+        pattern = (r'(?:生成|输出|写|制作|创作)\s*(?:再)?\s*'
+                   r'(\d{1,3}|[一二两三四五六七八九十])(?:个|条|篇|份)\s*'
+                   r'([^，。；;\n]{0,48}?)(?<![\d.])(\d+)\s*秒'
+                   r'([^，。；;\n]{0,48}?脚本)')
+        for count, before, seconds, after in re.findall(pattern, section):
+            if ('脚本' in before or re.search(r'(?:每段|单次|分段|豆包)', before)
+                    or re.search(r'(?:源|原|参考)视频.{0,3}$', before)
+                    or re.match(r'\s*(?:的)?(?:源|原|参考)视频', after)):
+                continue
+            count = int(count) if count.isdigit() else {'一':1,'二':2,'两':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9,'十':10}[count]
+            natural.append((count, int(seconds)))
+        values = set(natural)
+        if values:
+            if len(values) == 1:
+                count, seconds = values.pop()
+                if 0 < count <= 100 and requested_count in (None, count):
+                    return [seconds] * count
+            return []
     return []
 
 
@@ -138,6 +210,7 @@ class GeminiWeb:
         self._external_submission_accepted = False
         self._expected_prompt = ''
         self._expected_attachment_count = 0
+        self._last_refusal_context = None
 
     def _capture_diagnostic(self,stage,response='',error=''):
         """Persist failures locally; never export cookies, storage or authentication query strings."""
@@ -465,12 +538,14 @@ class GeminiWeb:
     def _normalized_prompt(text):
         return ' '.join((text or '').split())
 
-    def _draft_text(self):
+    def _draft_text(self, *, require_editor=False):
         try:
             selector=_combine(self.sel.get('prompt_editor')) or _PROMPT_EDITOR
             editor=self.page.locator(selector).filter(visible=True).first
             return editor.evaluate("e => e.isContentEditable ? e.innerText : e.value || e.textContent || ''")
         except Exception:
+            if require_editor:
+                raise GeminiSubmissionUncertain('Gemini 输入区无法校验，已停止原会话重发') from None
             return ''
 
     def _check_for_external_submission(self):
@@ -623,13 +698,115 @@ class GeminiWeb:
         chrome_markers=('New chat\nSearch chats','Search chats\nImages','Where should we start?')
         if any(marker in text for marker in chrome_markers):
             raise GeminiError('抓取到Gemini页面导航而非模型回复，已拒绝作为脚本')
-        if '我只是一个语言模型，理解不了这个问题，因此没法帮上忙' in text:
-            raise GeminiError('Gemini明确回复无法理解本次请求；已保存原始平台回复')
+        refusal = is_refusal_response(text)
+        if refusal and '我只是一个语言模型，理解不了这个问题，因此没法帮上忙' in text:
+            raise GeminiRefusalResponse('Gemini明确回复无法理解本次请求；未发往豆包，已保存拒答诊断')
+        if refusal:
+            raise GeminiRefusalResponse('Gemini明确拒绝或无法完成本次请求；未发往豆包，已保存拒答诊断')
         for pattern in _selectors(self.gcfg.get('error_patterns')):
             if pattern.lower() in text.lower():raise GeminiError(f'Gemini返回平台错误：{pattern}')
 
+    @staticmethod
+    def _input_fingerprint(paths):
+        """Bind a refusal retry to the actual files originally selected."""
+        identities=[]
+        try:
+            for value in paths:
+                path=Path(value).expanduser().resolve()
+                before=path.stat()
+                if not path.is_file():
+                    return None
+                digest=hashlib.sha256()
+                with path.open('rb') as handle:
+                    for chunk in iter(lambda:handle.read(1 << 20),b''):
+                        digest.update(chunk)
+                after=path.stat()
+                if (before.st_size,before.st_mtime_ns)!=(after.st_size,after.st_mtime_ns):
+                    return None
+                identities.append((str(path),after.st_size,digest.hexdigest()))
+        except (OSError,ValueError,TypeError,RuntimeError):
+            return None
+        return tuple(identities)
+
+    @staticmethod
+    def _turn_fingerprint(snapshot):
+        """Private in-memory turn identity; raw prompts are not diagnostic fields."""
+        try:
+            users=snapshot['user_count'];models=snapshot['model_count']
+            user_texts=snapshot['user_texts'];texts=snapshot['texts']
+            attachments=snapshot['user_attachment_counts']
+            if (not isinstance(users,int) or not isinstance(models,int)
+                    or users<0 or models<0 or len(user_texts)!=users
+                    or len(texts)!=models or len(attachments)!=users):
+                return None
+            digest=lambda value:hashlib.sha256(str(value).encode('utf-8')).hexdigest()
+            return (users,models,tuple(digest(' '.join(text.split())) for text in user_texts),
+                    tuple(digest(text) for text in texts),tuple(attachments))
+        except (KeyError,TypeError,AttributeError):
+            return None
+
+    def _remember_refusal(self,paths,original_message,full_prompt,inputs):
+        """Retain only a complete accepted invalid reply, regardless of its wording."""
+        self._last_refusal_context=None
+        try:
+            url=self.page.url;parsed=urlsplit(url)
+            snapshot=self._response_snapshot();fingerprint=self._turn_fingerprint(snapshot)
+            baseline=self._sent_baseline
+            if (inputs is None or not self._submission_attempted or not baseline or not fingerprint
+                    or parsed.scheme!='https' or parsed.hostname!='gemini.google.com'
+                    or self._stop_visible() or self._draft_text(require_editor=True).strip()
+                    or snapshot['user_count']!=baseline['user_count']+1
+                    or snapshot['model_count']!=baseline['model_count']+1
+                    or not snapshot['user_texts']
+                    or self._normalized_prompt(snapshot['user_texts'][-1])!=self._normalized_prompt(full_prompt)
+                    or snapshot['user_attachment_counts'][-1]!=len(paths)
+                    or self._fresh_response(snapshot,baseline)!=self._last_observed_response
+                    or not self._last_observed_response.strip()):
+                return
+            self._last_refusal_context=dict(page=self.page,url=url,turn=fingerprint,
+                paths=tuple(str(path) for path in paths),inputs=inputs,
+                original_message=original_message,full_prompt=full_prompt)
+        except Exception:
+            # Output classification remains truthful even if retry evidence
+            # cannot be captured. The retry entry will stop without sending.
+            return
+
+    def _verify_refusal_retry(self,paths,message,full_prompt,inputs,context):
+        if (tuple(str(path) for path in paths)!=context['paths']
+                or message!=context['original_message'] or full_prompt!=context['full_prompt']):
+            raise GeminiSubmissionUncertain('原指令或附件路径已变化，已停止原会话重发')
+        if inputs is None or inputs!=context['inputs']:
+            raise GeminiSubmissionUncertain('原附件内容已变化或无法校验，已停止原会话重发')
+        if self.page is not context['page'] or self.page.url!=context['url']:
+            raise GeminiSubmissionUncertain('Gemini 会话已变化，已停止原会话重发')
+        if self._stop_visible() or self._draft_text(require_editor=True).strip():
+            raise GeminiSubmissionUncertain('Gemini 正在回复或已有新草稿，已停止原会话重发')
+        snapshot=self._response_snapshot()
+        if self._turn_fingerprint(snapshot)!=context['turn']:
+            raise GeminiSubmissionUncertain('Gemini 对话已有新消息或发生变化，已停止重复发送')
+        return snapshot
+
+    def retry_last_rejected_response(self,video_paths,message_text):
+        """Replay identical inputs in the unchanged chat, under a caller's retry budget."""
+        context=self._last_refusal_context
+        self._last_refusal_context=None  # Each complete invalid reply grants one attempt.
+        if context is None:
+            raise GeminiSubmissionUncertain('缺少可校验的完整回复记录，不能重发原请求')
+        return self.generate(video_paths,message_text,_refusal_context=context)
+
+    def retry_last_refusal(self,video_paths,message_text):
+        """Compatibility alias for the former refusal-only entry."""
+        return self.retry_last_rejected_response(video_paths,message_text)
+
     # ---- 组合动作 ----
-    def generate(self,video_paths,message_text):
+    def generate(self,video_paths,message_text,*,_refusal_context=None):
+        original_message=message_text
+        video_paths=tuple(video_paths or ())
+        same_inputs=(_refusal_context is None or
+                     (tuple(str(path) for path in video_paths)==_refusal_context['paths']
+                      and message_text==_refusal_context['original_message']))
+        inputs=self._input_fingerprint(video_paths) if same_inputs else None
+        self._last_refusal_context=None
         requested_count=_explicit_script_count(message_text)
         targets=_requested_durations(message_text,requested_count)
         constraints=''
@@ -651,8 +828,16 @@ class GeminiWeb:
         self._expected_prompt=message_text
         self._expected_attachment_count=len(video_paths or [])
         try:
-            self.open()
-            self._sent_baseline=self._response_snapshot()
+            if _refusal_context is None:
+                self.open()
+                self._sent_baseline=self._response_snapshot()
+            else:
+                # Freeze the validated baseline before touching the composer.
+                # A human send after this point is still seen by upload/send
+                # reconciliation, rather than becoming an invisible baseline.
+                self._sent_baseline=self._verify_refusal_retry(
+                    video_paths,original_message,message_text,inputs,_refusal_context)
+                print('[Gemini] 已核对原会话与原素材，在同一对话重发完全相同指令',flush=True)
             self.type_prompt(message_text)
             print('[Gemini] 提示词草稿已填写，附件就绪前不会发送', flush=True)
             if video_paths:
@@ -668,26 +853,50 @@ class GeminiWeb:
                 self.send_prompt(message_text)
             response=self.wait_response()
             self._last_observed_response=response
+            self._check_errors(response)
+            from .script_splitter import (SCRIPT_HEADER_RE, TS_BLOCK_RE, parse_scripts,
+                                          detect_total_seconds, build_segments, parse_timestamp_blocks)
+            scripts=parse_scripts(response)
             if requested_count is not None:
-                from .script_splitter import parse_scripts
-                actual_count=len(parse_scripts(response))
+                actual_count=len(scripts)
                 if actual_count!=requested_count:
-                    raise GeminiError(f'Gemini脚本数量不符：提示词要求{requested_count}个，实际{actual_count}个，未发往豆包')
-            if targets:
-                from .script_splitter import parse_scripts,detect_total_seconds,build_segments,parse_timestamp_blocks
-                try:
-                    scripts=parse_scripts(response)
-                    actual=[detect_total_seconds(script) for script in scripts]
-                    if actual!=targets:
-                        raise GeminiError(f'Gemini脚本总时长不符：期望{targets}秒，实际{actual}秒，未发往豆包')
-                    for script in scripts:
-                        if not parse_timestamp_blocks(script):raise ValueError('缺少覆盖完整时长的时间戳')
-                        build_segments(script,self.cfg)
-                except ValueError as exc:raise GeminiError('Gemini时间轴不完整：'+str(exc)) from exc
+                    raise GeminiResponseRejected(f'Gemini脚本数量不符：提示词要求{requested_count}个，实际{actual_count}个，未发往豆包')
+            if not SCRIPT_HEADER_RE.search(response) or not scripts:
+                raise GeminiResponseRejected('Gemini回复缺少独立脚本标题或正文；未发往豆包，已保存原始回复')
+            try:
+                actual=[detect_total_seconds(script) for script in scripts]
+                if targets and actual!=targets:
+                    raise GeminiResponseRejected(f'Gemini脚本总时长不符：期望{targets}秒，实际{actual}秒，未发往豆包')
+                for script, total in zip(scripts, actual):
+                    if total is None or total <= 0:
+                        raise ValueError('缺少有效总时长')
+                    blocks=parse_timestamp_blocks(script)
+                    if not blocks:
+                        raise ValueError('缺少覆盖完整时长的时间戳')
+                    for block in blocks:
+                        content=[]
+                        for line in block['lines']:
+                            timestamp=TS_BLOCK_RE.match(line)
+                            line=timestamp.group(5).strip() if timestamp else line.strip()
+                            if not line:
+                                continue
+                            # Labels without any value do not make a script.
+                            value=line.split('：',1)[-1] if '：' in line else line.split(':',1)[-1]
+                            if re.search(r'[\w\u3400-\u9fff]', value):
+                                content.append(value)
+                        if not content:
+                            raise ValueError('时间块缺少画面或音频正文')
+                    build_segments(script,self.cfg)
+            except ValueError as exc:
+                raise GeminiResponseRejected('Gemini时间轴不完整：'+str(exc)+'；未发往豆包，已保存原始回复') from exc
             self._capture_diagnostic('completed',response=response)
             return response
         except Exception as exc:
             self._capture_diagnostic('failed',response=self._last_observed_response,error=str(exc))
+            if isinstance(exc, GeminiResponseRejected):
+                self._remember_refusal(video_paths,original_message,message_text,inputs)
+                exc.can_retry_same_request=self._last_refusal_context is not None
+                raise
             if self._submission_attempted:
                 raise GeminiSubmissionUncertain(f'{exc}；已尝试发送，本次停止自动重试，请先核对 Gemini 对话与本地诊断') from exc
             raise

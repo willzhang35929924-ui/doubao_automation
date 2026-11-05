@@ -1,6 +1,8 @@
 """账号状态与逐条视频额度账本；登录和新任务都不能重置额度。"""
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import hashlib
+import re
 from .state import JsonStore
 
 AVAILABLE='available'
@@ -53,6 +55,8 @@ class AccountManager:
         limit=int(day.get('limit',self.daily_limit))
         used=int(day.get('baseline_used',0))+sum(e.get('state')=='charged' for d,_,e in self._entries(acc) if d==today)
         reserved=sum(e.get('state')=='reserved' for _,_,e in self._entries(acc))
+        awaiting_approval=sum(e.get('state')=='reserved' and e.get('awaiting_user_approval') is True
+                              for _,_,e in self._entries(acc))
         unknown=sum(e.get('state') in ('submitted','unknown') for _,_,e in self._entries(acc))
         remaining=max(0,limit-used-reserved-unknown);reason='';status=acc.get('status',AVAILABLE)
         if status==DISABLED:reason='账号已禁用'
@@ -60,8 +64,10 @@ class AccountManager:
         elif day.get('platform_exhausted') or (status==EXHAUSTED and acc.get('date')==today):
             remaining,reason=0,'平台提示今日额度已耗尽'
         elif unknown:reason='已提交产物待核对；仅可恢复原请求'
+        elif awaiting_approval:reason='等待素材授权确认；保留原请求预留，尚未确认提交'
         elif remaining==0:reason='今日额度已用完或已预留'
         return dict(date=today,limit=limit,used=used,reserved=reserved,unknown=unknown,
+                    awaiting_approval=awaiting_approval,
                     remaining=remaining,estimated=bool(day.get('estimated',True)),blocked_reason=reason)
 
     def quota(self,name):return self._public(self.store.snapshot().get('accounts',{}).get(name,{}))
@@ -108,6 +114,7 @@ class AccountManager:
                     raise ValueError('视频任务已有额度记录，应恢复原请求而不是再次提交')
             quota=self._public(acc)
             if quota['unknown']:raise ValueError('账号有未决提交，仅可恢复原请求')
+            if quota['awaiting_approval']:raise ValueError('账号有等待授权的原请求，不能创建新请求')
             if quota['remaining']<len(task_ids):raise ValueError('账号剩余额度不足，不能部分预留此批次')
             today=self._today();entries=self._day(acc)['entries']
             for task_id in task_ids:
@@ -151,10 +158,14 @@ class AccountManager:
                     self._day(acc)['entries'].update(moved)
                     request['date']=self._today()
             request['submitted']=True
+            if request.get('approval_block'):
+                request['last_approval_block']=request.pop('approval_block')
             if chat_url:request['chat_url']=chat_url
             if baseline is not None:request['baseline']=deepcopy(baseline)
             for _,_,entry in self._entries(acc):
-                if entry.get('request_id')==request_id and entry.get('state')=='reserved':entry['state']='submitted'
+                if entry.get('request_id')==request_id and entry.get('state')=='reserved':
+                    entry['state']='submitted'
+                    entry.pop('awaiting_user_approval',None)
 
     def record_generated(self,name,task_id,request_id='',remote_ref=None):
         with self.store.txn() as data:
@@ -163,9 +174,13 @@ class AccountManager:
                       and (not request_id or e.get('request_id')==request_id) and e.get('state') not in ('cancelled','rejected')]
             if len(matching)!=1:raise ValueError('无法唯一确定已生成视频的额度记录')
             matching[0]['state']='charged'
+            matching[0].pop('awaiting_user_approval',None)
             if remote_ref is not None:matching[0]['remote_ref']=deepcopy(remote_ref)
             request=acc.get('quota_requests',{}).get(matching[0]['request_id'])
-            if request is not None:request['submitted']=True
+            if request is not None:
+                request['submitted']=True
+                if request.get('approval_block'):
+                    request['last_approval_block']=request.pop('approval_block')
 
     def mark_unknown(self,name,request_id,task_ids=None,note=''):
         selected=set(task_ids) if task_ids is not None else None
@@ -179,6 +194,47 @@ class AccountManager:
             if changed:
                 request=acc.get('quota_requests',{}).get(request_id)
                 if request is not None:request['submitted']=True
+
+    def mark_awaiting_approval(self,name,request_id,evidence):
+        """Keep the reservation only after proving an authorization blocked acceptance.
+
+        This is not a refund: the same slot remains held until explicitly handled.
+        Ambiguous submissions and generated assets cannot be converted by this path.
+        """
+        flags=('dialog_visible','draft_matches','marker_matches','no_user_messages',
+               'no_cards','fresh_route','before_accept_proven')
+        if (not isinstance(evidence,dict) or evidence.get('kind')!='material_authorization'
+                or evidence.get('request_id')!=request_id
+                or any(evidence.get(key) is not True for key in flags)):
+            raise ValueError('缺少本次素材授权阻塞的完整提交前证据，保留未知提交状态')
+        digest=lambda value:hashlib.sha256(re.sub(r'\s+','',str(value or '')).encode('utf-8')).hexdigest()
+        with self.store.txn() as data:
+            acc=self._account(data,name);request=acc.get('quota_requests',{}).get(request_id)
+            if not request:raise ValueError('没有此请求的额度预留')
+            baseline=request.get('baseline') or {}
+            ownership=baseline.get('ownership') if isinstance(baseline,dict) else None
+            if not isinstance(ownership,dict):
+                raise ValueError('请求缺少原始提交归属记录，不能改为未提交')
+            if (not ownership.get('prompt') or not ownership.get('marker')
+                    or evidence.get('prompt_sha256')!=digest(ownership['prompt'])
+                    or evidence.get('marker_sha256')!=digest(ownership['marker'])
+                    or baseline.get('ownership_acknowledged') is True
+                    or ownership.get('user_message_id') or ownership.get('original_anchor_proof')
+                    or request.get('chat_url')):
+                raise ValueError('请求已有接受证据或授权证据与原提示词不符，不能改为未提交')
+            matching=[e for _,_,e in self._entries(acc) if e.get('request_id')==request_id]
+            if (len(matching)!=len(request.get('task_ids') or []) or not matching
+                    or any(e.get('state') not in ('reserved','submitted','unknown')
+                           or e.get('remote_ref') for e in matching)):
+                raise ValueError('请求已有产物、已扣费或额度记录不完整，不能改为未提交')
+            proof={key:deepcopy(evidence[key]) for key in ('kind','request_id','prompt_sha256',
+                    'marker_sha256',*flags)}
+            note='等待素材授权确认；原预留保留，尚未确认提交'
+            request.update(submitted=False,approval_block=proof,note=note)
+            for entry in matching:
+                entry.update(state='reserved',awaiting_user_approval=True,note=note)
+            acc['note']=note
+            return [entry['task_id'] for entry in matching]
 
     def release_unsubmitted(self,name,request_id,task_ids=None):
         selected=set(task_ids) if task_ids is not None else None

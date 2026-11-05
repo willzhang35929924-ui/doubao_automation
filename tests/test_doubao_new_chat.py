@@ -104,6 +104,12 @@ class NewChatTests(unittest.TestCase):
         self.run_new_chat(page)
         self.assertEqual(page.clicks, 1)
 
+    def test_empty_local_route_is_a_supported_new_chat_transition(self):
+        page = Page(after=[(0, dict(url='https://www.doubao.com/chat/local_fixture', history=0))])
+        self.run_new_chat(page)
+        self.assertEqual(page.clicks, 1)
+        self.assertGreaterEqual(page.now, 1)
+
     def test_configured_string_is_one_selector_not_characters(self):
         page = Page()
         self.run_new_chat(page, selectors={'new_chat': '#new-chat'})

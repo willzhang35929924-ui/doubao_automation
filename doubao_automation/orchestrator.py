@@ -13,10 +13,11 @@ from pathlib import Path
 from .account_manager import AccountManager
 from .browser_pool import BrowserSession
 from .config import get, require_doubao_accounts
-from .doubao_agent import DoubaoAgent, GenerationFailed, NeedsLogin, QuotaExhausted
+from .doubao_agent import DoubaoAgent, GenerationFailed, NeedsLogin, NeedsUserAction, QuotaExhausted
 from .doubao_batch import verified_download_matches
 from .feishu_client import FeishuClient, FeishuError
-from .gemini_web import GeminiError, GeminiNotLoggedIn, GeminiSubmissionUncertain, GeminiWeb
+from .gemini_web import (GeminiError, GeminiNotLoggedIn, GeminiResponseRejected,
+                         GeminiSubmissionUncertain, GeminiWeb, is_refusal_response)
 from .paths import (FRAMES_DIR, ROOT, SCRIPTS_DIR, STATE_DIR, VIDEOS_DIR,
                     ensure_dirs, resolve, safe_filename)
 from .script_splitter import build_segments, parse_scripts, detect_total_seconds
@@ -128,18 +129,38 @@ class Pipeline:
         try:
             gw = GeminiWeb(session, self.cfg)
             gw.wait_logged_in()
-            retries = int(get(self.cfg, "gemini.retry_on_error", 2))
+            retries = min(2, max(0, int(get(self.cfg, "gemini.retry_on_error", 2))))
+            refusal_delay = max(0, min(float(get(self.cfg, "gemini.refusal_retry_delay_seconds", 5)), 60))
             for si in todo_idx:
                 src = sources[si]
                 message = messages[si]
+                video_paths = tuple(src.get("videos") or [])
                 text = ""
+                retry_rejected = False
                 for attempt in range(retries + 1):
                     try:
-                        text = gw.generate(src.get("videos") or [], message)
+                        if retry_rejected:
+                            text = gw.retry_last_rejected_response(list(video_paths), message)
+                        else:
+                            text = gw.generate(list(video_paths), message)
                         break
+                    except GeminiResponseRejected as exc:
+                        # Only a proven complete reply with an intact cached
+                        # context may repeat the same request. Error wording
+                        # alone is never evidence that resending is safe.
+                        if getattr(exc,'can_retry_same_request',False) is not True:
+                            raise
+                        if attempt >= retries:
+                            print(f'[scripts] Gemini回复校验失败已达{attempt + 1}/{retries + 1}次调用，停止本轮；尚未提交豆包',flush=True)
+                            raise
+                        retry_rejected = True
+                        print(f'[scripts] Gemini本轮完整回复未通过校验，按授权保持原指令/素材同会话重试{attempt + 2}/{retries + 1}；尚未提交豆包',flush=True)
+                        time.sleep(refusal_delay)
                     except (GeminiNotLoggedIn, GeminiSubmissionUncertain):
                         raise
                     except GeminiError as e:
+                        if retry_rejected:
+                            raise  # The one-shot retry context may already be consumed.
                         print(f"[scripts] 源 {src.get('record_id')} 第 {attempt + 1} 次失败: {e}")
                         if attempt < retries:
                             time.sleep(60)
@@ -198,6 +219,8 @@ class Pipeline:
             raise RuntimeError("还没有脚本，请先执行: python run_pipeline.py scripts")
         tasks = []
         for sc in scripts:
+            if is_refusal_response(sc.get('text','')):
+                raise ValueError('保存的 Gemini 回复是拒答而非视频剧本；未规划或提交任何生成任务')
             keyword = (sc.get("keyword") or "").strip()
             matches = [p for p in products if keyword and (p.get("keyword") or "").strip() == keyword]
             if not matches:
@@ -344,6 +367,8 @@ class Pipeline:
                 task.setdefault('target_seconds',task.get('est_seconds',15))
                 task.setdefault('raw_video','')
                 task.setdefault('remote_ref',{})
+                if task.get('failure_phase')=='invalid_script' and task.get('status')=='failed':
+                    continue
                 record=self.accounts.find_task(task['id'])
                 if record:
                     rid=record['request_id'];saved=record['request']
@@ -367,6 +392,12 @@ class Pipeline:
                                        baseline=saved.get('baseline') or request.get('baseline',{}))
                     task.update(account=record['account'],request_id=rid)
                     if record.get('remote_ref'):task['remote_ref']=record['remote_ref']
+                    if (request.get('phase')=='awaiting_user_approval' or saved.get('approval_block')):
+                        request.update(phase='awaiting_user_approval',submitted=bool(saved.get('submitted')),
+                                       approval_block=saved.get('approval_block') or request.get('approval_block'))
+                        if task['status']!='done':
+                            task.update(status='needs_user',error='等待原请求的素材授权处理；保留预留，禁止自动重新发送')
+                        continue
                     if task['status']!='done':
                         cloud,local=self._retry_counts(task,history.get(task['id'],{}))
                         task.update(attempts=cloud,cloud_attempts=cloud,local_attempts=local)
@@ -453,7 +484,14 @@ class Pipeline:
                             if task['status']!='done':task['status']='running'
                         return [dict(t) for t in batch]
                 quota=self.accounts.quota(account)
-                if quota['remaining']<1 or quota['unknown']:return None
+                if (quota['remaining']<1 or quota['unknown'] or quota.get('awaiting_approval')
+                        or any(r.get('account')==account and r.get('phase')=='awaiting_user_approval'
+                               for r in requests.values())):return None
+                script_texts={sc['id']:sc.get('text','') for sc in data.get('scripts',[])}
+                for task in tasks:
+                    if task['status']=='pending' and is_refusal_response(script_texts.get(task['script_id'],'')):
+                        task.update(status='failed',failure_phase='invalid_script',
+                                    error='Gemini 返回拒答而非视频剧本；未提交生成')
                 failed={t['script_id']:min(x['seg_index'] for x in tasks if x['script_id']==t['script_id'] and x['status']=='failed')
                         for t in tasks if t['status']=='failed'}
                 for task in tasks:
@@ -527,6 +565,16 @@ class Pipeline:
         ledger=self.accounts.request(account,rid)
         submitted=bool(ledger.get('submitted') or request.get('submitted'))
         script=next((s for s in self.store.snapshot().get('scripts',[]) if s['id']==tasks[0]['script_id']),{})
+        if not submitted and is_refusal_response(script.get('text','')):
+            self.accounts.release_unsubmitted(account,rid)
+            with self.store.txn() as data:
+                data['requests'][rid].update(phase='cancelled',submitted=False,failure_phase='invalid_script',
+                                            error='Gemini 返回拒答而非视频剧本，未提交生成')
+                for task in data['tasks']:
+                    if task['id'] in ids and task['status']!='done':
+                        task.update(status='failed',failure_phase='invalid_script',
+                                    error='Gemini 返回拒答而非视频剧本；已停止发送并释放未提交预留')
+            return False
         script_tasks=[t for t in self.store.snapshot().get('tasks',[]) if t['script_id']==tasks[0]['script_id']]
         context=dict(script_text=script.get('text',''),total_seconds=sum(float(t['target_seconds']) for t in script_tasks),
                      chat_url=request.get('chat_url',''),request_id=rid,baseline=request.get('baseline',{}),
@@ -597,6 +645,25 @@ class Pipeline:
                 saved['phase']='refunded' if saved.get('refunded_task_ids') else 'complete'
             self._assemble_all()
             return True
+        if kind=='user_approval':
+            evidence=result.get('approval_block')
+            with self.store.txn() as data:
+                data['requests'][rid]['approval_block']=evidence if isinstance(evidence,dict) else {}
+            try:
+                self.accounts.mark_awaiting_approval(account,rid,evidence)
+            except ValueError as exc:
+                # A visible dialog alone cannot prove that the provider did not accept.
+                # Keep the original uncertainty and a precise reason for the operator.
+                error=(error+'；'+str(exc))[:500]
+            else:
+                with self.store.txn() as data:
+                    data['requests'][rid].update(phase='awaiting_user_approval',submitted=False,
+                        failure_phase='before_accept',error_kind='user_approval',error=error,
+                        continuation_safe=False)
+                    for task in data['tasks']:
+                        if task['id'] in unresolved:
+                            task.update(status='needs_user',failure_phase='before_accept',error=error)
+                return False
         refunded=[]
         if submitted and kind=='partial_failed_refunded' and result.get('continuation_safe') is True:
             # A failed slot remains its original slot; never infer it from the number/order of successes.
@@ -650,7 +717,7 @@ class Pipeline:
                 data['requests'][rid].update(phase='unknown',submitted=True)
                 for task in data['tasks']:
                     if task['id'] in unresolved and not task.get('raw_video'):
-                        task.update(status='needs_user' if kind=='needs_user' else 'awaiting_result',error=error)
+                        task.update(status='needs_user' if kind in ('needs_user','user_approval') else 'awaiting_result',error=error)
         else:
             self.accounts.release_unsubmitted(account,rid)
             local_counts=getattr(self,'_local_attempts_this_run',{})
@@ -680,7 +747,7 @@ class Pipeline:
     def _has_unresolved(self,name):
         if not getattr(self,'store',None):return False
         snap=self.store.snapshot();tasks={t['id']:t for t in snap.get('tasks',[])}
-        return any(r.get('account')==name and r.get('phase') in ('reserved','submitted','unknown','downloading')
+        return any(r.get('account')==name and r.get('phase') in ('reserved','submitted','unknown','downloading','awaiting_user_approval')
                    and any(tasks.get(tid,{}).get('request_id')==r.get('request_id')
                            and tasks[tid].get('status')!='done' for tid in r.get('task_ids',[]))
                    for r in snap.get('requests',{}).values())
@@ -708,6 +775,18 @@ class Pipeline:
         except NeedsLogin as exc:
             self.accounts.mark_needs_login(name,str(exc))
             self._release_startup_reservation(name,batch,str(exc))
+        except NeedsUserAction as exc:
+            # An approval may appear while merely opening the account, before
+            # run_batch has a prompt or submission attempt to classify.
+            rid=batch[0]['request_id'];ledger=self.accounts.request(name,rid)
+            with self.store.txn() as data:
+                data['requests'][rid].update(
+                    phase='unknown' if ledger.get('submitted') else 'awaiting_user_approval',
+                    error_kind='user_approval',error=str(exc))
+                for task in data['tasks']:
+                    if task.get('request_id')==rid and task['status']!='done':
+                        task.update(status='needs_user',error=str(exc))
+            self.accounts.release(name)
         except Exception as exc:
             traceback.print_exc()
             if not opened:
@@ -763,7 +842,14 @@ class Pipeline:
             print(f"  {mark} {t['id']:<14} [{t['status']:<7}] {extra}")
         print("账号状态:")
         print(self.accounts.blocked_report() or "  暂无启用的豆包账号，请在工作台「账号库」添加账号并完成登录验证。")
-        if pending or failed:
+        approvals=any(r.get('phase')=='awaiting_user_approval'
+                      or (r.get('error_kind')=='user_approval' and r.get('phase') not in ('complete','cancelled','refunded'))
+                      for r in snap.get('requests',{}).values())
+        if approvals:
+            print('\n提示: 存在等待平台授权或核对的原请求；预留与提交记录已保留，不会自动重新发送。')
+        elif any(t.get('failure_phase')=='invalid_script' for t in snap.get('tasks',[])):
+            print('\n提示: Gemini 拒答不能作为视频剧本；请先取得有效剧本，程序不会提交这份拒答。')
+        elif pending or failed:
             print("\n提示: 待执行任务会在账号额度恢复（次日）或重新登录后，重跑 python run_pipeline.py run 自动续接。")
 
     def run_all(self, force: bool = False, from_saved: bool = False, limit: int = 0):

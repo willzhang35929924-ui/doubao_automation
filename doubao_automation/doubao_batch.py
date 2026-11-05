@@ -198,6 +198,56 @@ class BatchGenerationMixin:
         except Exception:
             pass
 
+    @staticmethod
+    def _fresh_chat_route(url):
+        parsed = urlsplit(url)
+        return (parsed.hostname in ('www.doubao.com', 'doubao.com')
+                and bool(re.fullmatch(r'/chat/?|/chat/local_[^/]+/?', parsed.path)))
+
+    def _approval_block_evidence(self, context, baseline, remote_refs):
+        ownership = getattr(self, '_batch_ownership', {})
+        digest = lambda text: hashlib.sha256(re.sub(r'\s+', '', str(text or '')).encode('utf-8')).hexdigest()
+        kind = None
+        try:
+            kind = self._approval_dialog_kind()
+        except Exception:
+            pass
+        evidence = dict(kind=kind or 'platform_terms', request_id=context.get('request_id', ''),
+                        prompt_sha256=digest(ownership.get('prompt')),
+                        marker_sha256=digest(ownership.get('marker')),
+                        dialog_visible=bool(kind), draft_matches=False, marker_matches=False,
+                        no_user_messages=False, no_cards=False, fresh_route=False,
+                        before_accept_proven=False)
+        try:
+            selectors = getattr(self, 'sel', {}).get('input_box') or '[contenteditable="true"][role="textbox"], textarea'
+            if not isinstance(selectors, str):
+                selectors = ', '.join(selectors)
+            state = self.page.evaluate('''({prompt, marker, selector}) => {
+              const norm = text => String(text || '').replace(/\\s+/g, '');
+              const visible = e => !!(e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden');
+              const editors = [...document.querySelectorAll(selector)].filter(visible);
+              const draft = editors.length === 1 ? norm(editors[0].value || editors[0].innerText || '') : '';
+              const users = document.querySelectorAll('[data-testid="send_message"], [data-message-role="user"], [data-role="user"]');
+              const cards = document.querySelectorAll('[class*="block-video-"], [class*="fulfill-video-error-box-"], video');
+              return {draft_matches: !!prompt && draft.includes(norm(prompt)),
+                      marker_matches: !!marker && draft.includes(norm(marker)),
+                      no_user_messages: users.length === 0, no_cards: cards.length === 0,
+                      fresh_route: ['www.doubao.com','doubao.com'].includes(location.hostname) &&
+                        /^\\/chat\\/?$|^\\/chat\\/local_[^/]+\\/?$/.test(location.pathname)};
+            }''', dict(prompt=ownership.get('prompt', ''), marker=ownership.get('marker', ''), selector=selectors))
+            evidence.update({key: value is True for key, value in state.items() if key in evidence})
+        except Exception:
+            return evidence
+        evidence['before_accept_proven'] = bool(
+            evidence['kind'] == 'material_authorization'
+            and all(evidence[key] for key in ('dialog_visible', 'draft_matches', 'marker_matches',
+                                              'no_user_messages', 'no_cards', 'fresh_route'))
+            and getattr(self, '_batch_send_started_fresh', False)
+            and getattr(self, '_batch_initial_send_attempted', False)
+            and not baseline.get('ownership_acknowledged') and not remote_refs
+            and not ownership.get('user_message_id') and not ownership.get('original_anchor_proof'))
+        return evidence
+
     def configure_video_mode(self, inspect_menu=False):
         """Select the existing video skill and its 15-second control when exposed."""
         skill = self.dcfg.get('video_skill_name', '视频生成')
@@ -275,9 +325,17 @@ class BatchGenerationMixin:
         observed=self.page.evaluate('''ownership => {
           const norm = text => String(text || '').replace(/\\s+/g, '');
           const canonical = [...document.querySelectorAll('[data-testid="send_message"], [data-testid="receive_message"]')];
-          const messages = canonical.length ? canonical :
-            [...document.querySelectorAll('[data-message-role="user"], [data-message-role="assistant"], [data-role="user"], [data-role="assistant"]')]
-              .filter((node, index, all) => !all.some((other, j) => j !== index && other.contains(node)));
+          const canonicalRoots = canonical.filter((node, index, all) =>
+            !all.some((other, j) => j !== index && other.contains(node)));
+          const roles = [...document.querySelectorAll('[data-message-role="user"], [data-message-role="assistant"], [data-role="user"], [data-role="assistant"]')]
+            .filter(node => !canonical.some(other => node.contains(other) || other.contains(node)));
+          // Broad layout role ancestors can contain several canonical turns.
+          // Keep canonical messages authoritative and add only distinct role
+          // leaves, preserving interleaved DOM order across both UI variants.
+          const roleLeaves = roles.filter((node, index, all) =>
+            !all.some((other, j) => j !== index && node.contains(other)));
+          const messages = [...canonicalRoots, ...roleLeaves].sort((a, b) =>
+            a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1);
           const user = node => node.matches('[data-testid="send_message"], [data-message-role="user"], [data-role="user"]');
           const id = node => node.closest('[data-message-id]')?.getAttribute('data-message-id') || node.id || '';
           const owns = node => {
@@ -298,7 +356,13 @@ class BatchGenerationMixin:
           }
           // No authenticated ownership proof means no asset, including when
           // old history hydrates after an apparently empty composer.
-          const empty = {cards:[], assets:[], owner_found:false, route_ready:false, latest_reply:''};
+          const markerMatches = ownership.marker ? messages.filter(node => user(node) &&
+            norm(node.querySelector('[data-testid="message_text_content"]')?.innerText || node.innerText).includes(norm(ownership.marker))) : [];
+          // A unique request marker may bind a recovery route while the full
+          // prompt is still hydrating. It never grants access to assets.
+          const routeMarkerFound = markerMatches.length === 1;
+          const empty = {cards:[], assets:[], owner_found:false, route_ready:false,
+                         route_marker_found:routeMarkerFound, latest_reply:''};
           if (!anchors.length && ownership.allow_verified_control_anchor === true &&
               ownership.chat_path === location.pathname && /^\\/chat\\/\\d+\\/?$/.test(location.pathname)) {
             // Virtual lists can unmount the original prompt. Only a prior
@@ -318,6 +382,7 @@ class BatchGenerationMixin:
           const routeReady = /^\\/chat\\/\\d+\\/?$/.test(location.pathname) &&
             (!ownership.chat_path || ownership.chat_path === location.pathname);
           const metadata = {owner_found:true, route_ready:routeReady, user_message_id:originalUserID,
+                            route_marker_found:routeMarkerFound,
                             anchor_kind:anchorKind, control_message_id:anchorKind === 'verified_control' ? id(anchor) : '',
                             chat_path:location.pathname, latest_reply:''};
           if (!routeReady) return {...empty, ...metadata};
@@ -480,6 +545,8 @@ class BatchGenerationMixin:
         resume = bool(context.get('resume_only'))
         baseline = dict(context.get('baseline') or {})
         self._batch_scope_state = None
+        self._batch_send_started_fresh = False
+        self._batch_initial_send_attempted = False
         self._batch_ownership = self._ownership_spec(tasks, context, baseline, resume)
         baseline['ownership'] = self._batch_ownership
         known = {tid: ref for tid, ref in result['remote_refs'].items()
@@ -543,6 +610,8 @@ class BatchGenerationMixin:
                 on_submitted('', baseline)
                 result.update(submitted=True, chat_url='')
                 last_url = ''
+                self._batch_send_started_fresh = self._fresh_chat_route(self.page.url)
+                self._batch_initial_send_attempted = True
                 self.type_and_send(prompt)
                 self._save_batch_debug(context)
             self._batch_body_before = baseline.get('body', '')
@@ -557,6 +626,21 @@ class BatchGenerationMixin:
                 assets = self._batch_assets()
                 scope = getattr(self, '_batch_scope_state', None)
                 ownership_changed = False
+                candidate = urlsplit(self.page.url)
+                if (not resume and self._batch_send_started_fresh and self._batch_initial_send_attempted
+                        and candidate.hostname in ('www.doubao.com', 'doubao.com')
+                        and re.fullmatch(r'/chat/\d+/?', candidate.path)
+                        and scope is not None and scope.get('route_marker_found') is True
+                        and not baseline.get('ownership_acknowledged')):
+                    observed_url = baseline.get('route_observed_before_ownership')
+                    if observed_url and observed_url != self.page.url:
+                        result.update(error_kind='needs_user', error='消息归属确认前正式对话地址再次变化；保留首次地址，禁止领取其他会话视频或重复发送')
+                        return result
+                    if not observed_url:
+                        baseline['route_observed_before_ownership'] = self.page.url
+                        on_submitted(self.page.url, baseline)
+                        result['chat_url'] = last_url = self.page.url
+                        print(f'[{self.name}] 已保存正式对话恢复地址，继续核对本次消息归属', flush=True)
                 if scope is not None:
                     if not scope.get('owner_found') or not scope.get('route_ready'):
                         now = time.monotonic()
@@ -590,6 +674,8 @@ class BatchGenerationMixin:
                 if self.page.url != last_url or ownership_changed or (scope is not None and baseline.get('ownership_acknowledged') is not True):
                     last_url = self.page.url
                     if scope is not None:
+                        if baseline.get('ownership_acknowledged') is not True:
+                            print(f'[{self.name}] 平台已接受本次消息，等待视频生成…', flush=True)
                         baseline['ownership_acknowledged'] = True
                     on_submitted(last_url, baseline)
                     result['chat_url'] = last_url
@@ -757,6 +843,15 @@ class BatchGenerationMixin:
             return result
         except Exception as exc:
             self._save_batch_debug(context,str(exc))
+            if getattr(exc, 'approval_kind', None):
+                evidence = self._approval_block_evidence(context, baseline, result['remote_refs'])
+                proven = evidence['before_accept_proven']
+                result.update(error_kind='user_approval', error=str(exc), approval_block=evidence,
+                              failure_phase='before_accept' if proven else 'approval_unresolved',
+                              continuation_safe=proven)
+                if proven:
+                    result['submitted'] = False
+                return result
             kind = {'NeedsLogin': 'login', 'QuotaExhausted': 'quota', 'NeedsUserAction': 'needs_user'}.get(type(exc).__name__, 'failed')
             result.update(error_kind=kind, error=str(exc), continuation_safe=not result['submitted'])
             return result

@@ -34,7 +34,9 @@ class GenerationTimeout(GenerationFailed):
 
 
 class NeedsUserAction(GenerationFailed):
-    pass
+    def __init__(self, message, *, approval_kind=None):
+        super().__init__(message)
+        self.approval_kind = approval_kind
 
 
 def _combine(selectors) -> str:
@@ -73,23 +75,114 @@ class DoubaoAgent(BatchGenerationMixin):
         return self.session.page
 
     # ---- 模态对话框处理 ----
+    @staticmethod
+    def _approval_kind(text):
+        text = ' '.join((text or '').split())
+        if (any(value in text for value in ('已获充分授权', '无侵权违法风险'))
+                or ('安全确认' in text and '素材' in text
+                    and any(value in text for value in ('授权', '侵权', '自行承担')))):
+            return 'material_authorization'
+        if any(value in text for value in ('协议', '条款', '阅读并同意', '使用规范')):
+            return 'platform_terms'
+        if any(value in text for value in ('人机验证', '验证码', '安全验证')):
+            return 'human_verification'
+        return None
+
+    def _visible_dialogs(self):
+        dialogs = self.page.locator('[role="dialog"], [role="alertdialog"], [aria-modal="true"]')
+        return [dialogs.nth(i) for i in range(dialogs.count()) if dialogs.nth(i).is_visible()]
+
+    def _approval_dialog_kind(self):
+        for dialog in self._visible_dialogs():
+            kind = self._approval_kind(dialog.inner_text(timeout=2000))
+            if kind:
+                return kind
+        # The material-authorization popup has also shipped without a dialog
+        # role. Bind its exact visible heading to a small container with buttons;
+        # a quoted sentence in old chat history is not a dialog.
+        heading_finder = getattr(self.page, 'get_by_text', None)
+        if heading_finder is None:
+            return None
+        headings = heading_finder('安全确认', exact=True)
+        for i in range(headings.count()):
+            heading = headings.nth(i)
+            if not heading.is_visible():
+                continue
+            if heading.evaluate('''e => !!e.closest('[data-testid="send_message"], [data-testid="receive_message"], [data-message-role], [data-role], [contenteditable], textarea')'''):
+                continue
+            box = heading.locator('xpath=ancestor::*[.//button][1]')
+            if box.count() and box.first.evaluate("e => !['BODY','HTML'].includes(e.tagName)"):
+                text = box.first.inner_text(timeout=2000)
+                if len(text) <= 4000 and self._approval_kind(text) == 'material_authorization':
+                    return 'material_authorization'
+        return None
+
+    def _wait_for_user_approval(self, kind):
+        try:
+            timeout = float(self.dcfg.get('user_approval_timeout_seconds', 300))
+            if not 0 <= timeout <= 1800:
+                raise ValueError('invalid approval timeout')
+        except (TypeError, ValueError):
+            raise NeedsUserAction('人工确认等待时间配置无效；已暂停，不能绕过授权窗口', approval_kind=kind) from None
+        deadline = time.monotonic() + timeout
+        label = '素材授权安全确认' if kind == 'material_authorization' else '平台协议或人工验证'
+        print(f'[{self.name}] 等待人工处理豆包{label}，浏览器保持打开（最多{timeout:g}秒）；程序不会点击确认或绕过', flush=True)
+        next_log = time.monotonic() + 10
+        while True:
+            try:
+                current = self._approval_dialog_kind()
+            except Exception:
+                raise NeedsUserAction('无法确认人工授权窗口是否已完成；已暂停，禁止自动确认或重新提交', approval_kind=kind) from None
+            if not current:
+                break
+            now = time.monotonic()
+            if now >= deadline:
+                raise NeedsUserAction(f'豆包{label}尚未由用户完成；本次已暂停，不能自动确认或重新提交',
+                                      approval_kind=kind)
+            if now >= next_log:
+                print(f'[{self.name}] 仍在等待人工确认；尚未把本次操作认定为平台已接受', flush=True)
+                next_log = now + 10
+            self.page.wait_for_timeout(max(1, int(min(.5, deadline - now) * 1000)))
+        print(f'[{self.name}] 人工操作窗口已关闭，继续核对平台是否接受本次消息', flush=True)
+
+    def _dialog_state(self):
+        for attempt in range(3):
+            try:
+                kind = self._approval_dialog_kind()
+                if kind:
+                    return kind, None, ''
+                dialogs = self._visible_dialogs()
+                if not dialogs:
+                    return None, None, ''
+                dialog = dialogs[0]
+                text = ' '.join(dialog.inner_text(timeout=2000).split())
+                # The popup can hydrate between the first observation and the
+                # text read. Check again before any dismissal or key press.
+                return self._approval_kind(text), dialog, text
+            except NeedsUserAction:
+                raise
+            except Exception:
+                if attempt == 2:
+                    break
+                try:
+                    self.page.wait_for_timeout(200)
+                except Exception:
+                    break
+        raise NeedsUserAction('无法安全读取平台弹窗状态；已暂停，禁止点击或回车发送',
+                              approval_kind='unresolved_dialog') from None
+
     def _handle_dialogs(self):
-        """处理模态对话框：新协议交给用户、保留生成进度，其余关闭/Escape。
-        每次处理都打印对话框文本，便于后续针对性优化。"""
+        """Leave approval decisions to the user; never dismiss legal dialogs."""
         page = self.page
         for _ in range(4):
-            try:
-                dlg = page.locator('div[role="dialog"][data-state="open"]')
-                if dlg.count() == 0:
-                    return
-                txt = " ".join(dlg.first.inner_text(timeout=2000).split())[:300]
-            except Exception:
+            kind, dlg, txt = self._dialog_state()
+            if kind:
+                self._wait_for_user_approval(kind)
+                continue
+            if dlg is None:
                 return
-            print(f"[{self.name}] 检测到模态对话框: {txt!r}")
+            print(f'[{self.name}] 检测到非授权类平台对话框', flush=True)
             acted = False
-            # 新法律条款需要用户在浏览器中自行确认。
-            if any(k in txt for k in ("协议", "条款", "阅读并同意")):
-                raise NeedsUserAction('豆包出现新的协议或条款，需要用户在窗口中确认后继续')
             # ② 生成进度类 → 不关闭（关了可能取消生成）
             if not acted and any(k in txt for k in ("生成中", "排队", "进度", "正在生成", "预计")):
                 print(f"[{self.name}] 对话框疑似生成进度，保持打开")
@@ -98,7 +191,7 @@ class DoubaoAgent(BatchGenerationMixin):
             if not acted:
                 for sel in ('button[aria-label*="关闭"]', 'button[aria-label*="Close"]'):
                     try:
-                        b = dlg.first.locator(sel).first
+                        b = dlg.locator(sel).first
                         if b.count() > 0 and b.is_visible():
                             b.click(timeout=2000)
                             acted = True
@@ -108,7 +201,7 @@ class DoubaoAgent(BatchGenerationMixin):
             if not acted:
                 for label in ("我知道了", "知道了", "取消", "关闭", "暂不", "以后再说"):
                     try:
-                        b = dlg.first.get_by_role("button", name=label).first
+                        b = dlg.get_by_role("button", name=label).first
                         if b.count() > 0 and b.is_visible():
                             b.click(timeout=2000)
                             acted = True
@@ -136,7 +229,7 @@ class DoubaoAgent(BatchGenerationMixin):
         url = urlsplit(self.page.url)
         if url.scheme != 'https' or url.hostname not in ('www.doubao.com', 'doubao.com'):
             return False
-        if fresh and url.path.rstrip('/') != '/chat':
+        if fresh and not self._fresh_chat_route(self.page.url):
             return False
         boxes = self.page.locator(_combine(self.sel.get('input_box')) or
                                   '[contenteditable="true"], textarea, [role="textbox"]')
@@ -281,23 +374,35 @@ class DoubaoAgent(BatchGenerationMixin):
     def send(self) -> bool:
         """点击发送按钮；找不到按钮时按 Enter 兜底。返回是否用按钮发送。"""
         page = self.page
+        self._handle_dialogs()
         for sel in (self.sel.get("send_button") or []):
             try:
                 btn = page.locator(sel).first
                 if btn.count() > 0 and btn.is_visible():
-                    btn.click(timeout=4000)
+                    if not btn.is_enabled():
+                        raise GenerationFailed('发送按钮尚未就绪，未触发发送')
+                    try:
+                        btn.click(timeout=4000)
+                    except Exception as exc:
+                        self._handle_dialogs()
+                        raise GenerationFailed('发送按钮操作结果未确认，已停止重复点击或回车重发') from exc
                     page.wait_for_timeout(1500)
+                    self._handle_dialogs()
                     return True
+            except (NeedsUserAction, GenerationFailed):
+                raise
             except Exception:
                 continue
+        self._handle_dialogs()
         page.keyboard.press("Enter")
         page.wait_for_timeout(1500)
+        self._handle_dialogs()
         return False
 
     def type_and_send(self, text: str):
         self.type_text(text)
         by_button = self.send()
-        print(f"[{self.name}] 提示词已发送（{len(text)} 字，按钮发送={by_button}），等待视频生成…")
+        print(f"[{self.name}] 已触发发送（{len(text)} 字，按钮发送={by_button}），等待平台接受确认…", flush=True)
 
     # ---- 结果监控 ----
     def _recent_text(self) -> str:

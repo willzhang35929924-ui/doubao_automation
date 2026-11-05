@@ -115,6 +115,23 @@ class AssetOwnershipTests(unittest.TestCase):
         self.assertTrue(assets[0]['ownership_verified'])
         self.assertEqual(self.agent._assistant_text(), 'office ready')
 
+    def test_role_only_owner_is_found_alongside_older_canonical_messages(self):
+        own = self.own_user().replace('data-testid="send_message" ', '')
+        answer = assistant('role-answer').replace('data-testid="receive_message" ', '')
+        self.page.set_content(user('old-user', 'OLD TASK') + assistant('old-answer') + own + answer)
+        self.assertEqual([asset['card_message_id'] for asset in self.agent._batch_assets()], ['role-answer'])
+
+    def test_nested_role_and_canonical_message_are_one_owner(self):
+        nested = '<section data-message-id="owner" data-role="user"><div data-testid="send_message">OFFICE TASK 【任务 marker-unique】</div></section>'
+        self.page.set_content(nested + assistant('one-answer'))
+        self.assertEqual([asset['card_message_id'] for asset in self.agent._batch_assets()], ['one-answer'])
+
+    def test_role_layout_ancestor_does_not_hide_distinct_role_messages(self):
+        own = self.own_user().replace('data-testid="send_message" ', '')
+        answer = assistant('role-answer').replace('data-testid="receive_message" ', '')
+        self.page.set_content('<main data-role="assistant">' + own + answer + '</main>')
+        self.assertEqual([asset['card_message_id'] for asset in self.agent._batch_assets()], ['role-answer'])
+
     def test_next_unrelated_user_turn_closes_ownership_scope(self):
         self.page.set_content(self.own_user() + assistant('office-answer') +
                               user('other-user', 'HIKING TASK') + assistant('hiking-answer', text='wrong reply'))
@@ -286,6 +303,52 @@ class AssetOwnershipTests(unittest.TestCase):
         self.assertTrue(result['submitted'])
         self.assertEqual(submitted, [''])
         self.assertFalse(destination.exists())
+
+    def test_new_numeric_route_is_saved_before_owner_hydration_without_claiming_cards(self):
+        self.page.goto('https://www.doubao.com/chat/')
+        self.page.set_content('')
+        self.agent.dcfg['ownership_ack_timeout_seconds'] = .05
+        def send(prompt):
+            self.agent.sent.append(prompt)
+            self.page.evaluate("history.pushState({},'', '/chat/12340000000006')")
+            self.page.locator('body').evaluate('(e,markup)=>e.insertAdjacentHTML("beforeend",markup)',
+                                               user('partial-new-user', self.agent._batch_ownership['marker']) +
+                                               assistant('not-yet-owned-answer'))
+        self.agent.type_and_send = send
+        task = dict(id='route#0', seg_index=0, seg_total=1, target_seconds=15,
+                    est_seconds=15, start_seconds=0, end_seconds=15, prompt='ROUTE TASK')
+        submitted = []
+        result = self.agent.run_batch([task], [], {'route#0': Path(self.temp.name) / 'unclaimed.mp4'},
+            {'request_id': 'route-request', 'total_seconds': 15},
+            lambda url, baseline: submitted.append((url, bool(baseline.get('ownership_acknowledged')))),
+            lambda *args: self.fail('No owned result exists'))
+        self.assertEqual(result['error_kind'], 'needs_user')
+        self.assertEqual(result['chat_url'], 'https://www.doubao.com/chat/12340000000006')
+        self.assertEqual(submitted, [('', False), (result['chat_url'], False)])
+        self.assertFalse(result['remote_refs'])
+        self.agent.session.context.request.get.assert_not_called()
+
+    def test_numeric_navigation_without_this_request_marker_is_not_saved_as_recovery(self):
+        self.page.goto('https://www.doubao.com/chat/')
+        self.page.set_content('')
+        self.agent.dcfg['ownership_ack_timeout_seconds'] = .05
+        def send(prompt):
+            self.agent.sent.append(prompt)
+            self.page.evaluate("history.pushState({},'', '/chat/12340000000007')")
+            self.page.locator('body').evaluate('(e,markup)=>e.insertAdjacentHTML("beforeend",markup)',
+                                               user('old-user', 'OLD TASK') + assistant('old-answer'))
+        self.agent.type_and_send = send
+        task = dict(id='route#0', seg_index=0, seg_total=1, target_seconds=15,
+                    est_seconds=15, start_seconds=0, end_seconds=15, prompt='ROUTE TASK')
+        submitted = []
+        result = self.agent.run_batch([task], [], {'route#0': Path(self.temp.name) / 'old-route.mp4'},
+            {'request_id': 'route-request', 'total_seconds': 15},
+            lambda url, baseline: submitted.append(url), lambda *args: self.fail('No owned result exists'))
+        self.assertEqual(result['error_kind'], 'needs_user')
+        self.assertEqual(result['chat_url'], '')
+        self.assertEqual(submitted, [''])
+        self.assertFalse(result['remote_refs'])
+        self.agent.session.context.request.get.assert_not_called()
 
     def test_resume_rejects_local_route_before_navigation_and_never_sends(self):
         before = self.page.url

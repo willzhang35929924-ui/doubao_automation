@@ -38,8 +38,11 @@ _UI_PREFIX_RE = re.compile(r"(?im)^\s*(gemini said|gemini 说|模型回复|ai �
 
 # 时间戳块: "00:00 - 00:04｜摄影与构图：…" / "0:00-0:05 | …"
 TS_BLOCK_RE = re.compile(
-    r"^\s*(\d{1,2})[:：](\d{2})\s*[-–~—]\s*(\d{1,2})[:：](\d{2})\s*[｜|]?\s*(.*)$",
-    re.MULTILINE,
+    r"^\s*(?:[-*#•]+\s+)?"
+    r"(?:(?:\*\*)?[【\[]\s*(?:时间轴|时间戳|时间线|时间段|Timeline|Timestamp)"
+    r"\s*[】\]](?:\*\*)?\s*[:：]?\s*)?"
+    r"(\d{1,2})[:：](\d{2})\s*[-–~—]\s*(\d{1,2})[:：](\d{2})\s*[｜|]?\s*(.*)$",
+    re.MULTILINE | re.IGNORECASE,
 )
 
 _NUMBER = r"\d+(?:\.\d+)?"

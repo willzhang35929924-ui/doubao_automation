@@ -12,6 +12,10 @@ from doubao_automation.paths import use_workspace_temp
 
 
 EDITOR = '<rich-textarea><div contenteditable="true" role="textbox"></div></rich-textarea>'
+MANUAL_SCRIPT = ('Script 01：本地夹具（总时长15秒）\n总时长：15秒\n'
+                 '00:00-00:05\n画面：展示产品。\n口播：第一段。\n'
+                 '00:05-00:10\n画面：使用产品。\n口播：第二段。\n'
+                 '00:10-00:15\n画面：产品定格。\n口播：第三段。')
 
 
 class GeminiUploadTests(unittest.TestCase):
@@ -238,14 +242,16 @@ class GeminiUploadTests(unittest.TestCase):
               editor.innerText='';document.querySelector('#attachments').replaceChildren();
               document.body.append(turn);
               const answer=document.createElement('model-response');
-              answer.textContent='fresh manual reply';document.body.append(answer);
+              answer.style.whiteSpace='pre-wrap';answer.style.display='block';
+              answer.textContent=window.fixtureReply;document.body.append(answer);
             };''')
+        self.page.evaluate('(text)=>window.fixtureReply=text', MANUAL_SCRIPT)
 
     def test_manual_send_during_upload_uses_real_class_selector_and_never_resends(self):
         self.manual_submission_fixture(1)
         self.agent.open=lambda:None
         self.cfg['gemini']['response_stable_seconds']=0
-        self.assertEqual(self.agent.generate([self.video], 'fixture instruction'), 'fresh manual reply')
+        self.assertEqual(self.agent.generate([self.video], 'fixture instruction'), MANUAL_SCRIPT)
         self.assertEqual(self.page.locator('user-query').count(),1)
         self.assertFalse(self.page.evaluate('Boolean(window.autoSendCount)'))
         self.assertTrue(self.agent._external_submission_accepted)
