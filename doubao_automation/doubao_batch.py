@@ -1,7 +1,12 @@
 """Bounded two-video requests and recoverable downloads, without resubmitting unknown work."""
 import hashlib
+import json
+import os
 import re
+import shutil
+import tempfile
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -69,7 +74,115 @@ def choose_reply(text):
     return ''
 
 
+def verified_download_matches(path, remote_ref):
+    """Read-only shared raw-file validation for recovery and generation paths."""
+    verifier = BatchGenerationMixin()
+    return verifier._bound_download_matches(path, remote_ref, remote_ref)
+
+
 class BatchGenerationMixin:
+    @staticmethod
+    def _file_hash(path):
+        digest = hashlib.sha256()
+        with Path(path).open('rb') as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b''):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _asset_identity(self, asset):
+        if not isinstance(asset, dict) or asset.get('ownership_verified') is not True:
+            return None
+        message_id = asset.get('card_message_id') or asset.get('message_id')
+        if not message_id:
+            return None
+        return {'key': asset.get('key') or self._key_asset(asset), 'message_id': str(message_id),
+                'ordinal': asset.get('card_ordinal') if asset.get('kind') == 'card' else asset.get('message_ordinal'),
+                'owner_user_message_id': asset.get('owner_user_message_id', '')}
+
+    def _bound_download_matches(self, path, asset, original_ref):
+        path = Path(path)
+        identity = self._asset_identity(asset)
+        if not identity or identity != self._asset_identity(original_ref or {}):
+            return False
+        try:
+            binding = json.loads(path.with_suffix(path.suffix + '.asset.json').read_text(encoding='utf-8'))
+            return (isinstance(binding, dict) and path.stat().st_size > 1000 and binding.get('identity') == identity
+                    and binding.get('size') == path.stat().st_size
+                    and binding.get('sha256') == self._file_hash(path))
+        except (OSError, ValueError, TypeError):
+            return False
+
+    def _preserve_unbound_download(self, path):
+        path = Path(path)
+        if not path.exists():
+            return
+        archive = path.parent / '.download-backups'
+        archive.mkdir(exist_ok=True, mode=0o700)
+        backup = archive / (path.name + '.' + self._file_hash(path) + '.unverified')
+        if not backup.exists():
+            shutil.copy2(path, backup)
+            backup.chmod(0o600)
+            sidecar = path.with_suffix(path.suffix + '.asset.json')
+            if sidecar.exists():
+                shutil.copy2(sidecar, backup.with_suffix(backup.suffix + '.asset.json'))
+
+    def _bind_download(self, path, asset):
+        path = Path(path)
+        identity = self._asset_identity(asset)
+        if not identity:
+            raise ValueError('下载文件缺少本请求的产物身份，不能登记为已完成')
+        binding = {'version': 1, 'identity': identity, 'size': path.stat().st_size,
+                   'sha256': self._file_hash(path)}
+        fd, filename = tempfile.mkstemp(prefix='.asset-', suffix='.json.part', dir=path.parent)
+        temporary = Path(filename)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                json.dump(binding, handle, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path.with_suffix(path.suffix + '.asset.json'))
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _original_anchor_proof(ownership, chat_path):
+        """Record only after the complete original user turn was verified."""
+        if not re.fullmatch(r'/chat/\d+/?', str(chat_path or '')) or not ownership.get('prompt'):
+            raise ValueError('原消息证明必须绑定完整提示词和正式数字ID对话')
+        digest = lambda text: hashlib.sha256(re.sub(r'\s+', '', str(text or '')).encode('utf-8')).hexdigest()
+        return {'version': 1, 'chat_path': chat_path,
+                'prompt_sha256': digest(ownership['prompt']), 'marker_sha256': digest(ownership.get('marker'))}
+
+    @staticmethod
+    def _ownership_spec(tasks, context, baseline, resume):
+        """Bind outputs to a particular submitted user turn, never a page-wide index."""
+        def complete(spec):
+            spec['task_ids'] = list(context.get('original_task_ids') or [task['id'] for task in tasks])
+            try:
+                proof_valid = spec.get('original_anchor_proof') == BatchGenerationMixin._original_anchor_proof(spec, spec.get('chat_path'))
+            except ValueError:
+                proof_valid = False
+            # A collapsed original turn cannot establish the slot ordering of
+            # a multi-output request. Keep that ambiguous case fail-closed.
+            spec['allow_verified_control_anchor'] = bool(proof_valid and len(spec['task_ids']) == 1)
+            return spec
+        saved = baseline.get('ownership')
+        if isinstance(saved, dict) and any(saved.get(k) for k in ('marker', 'prompt', 'user_message_id')):
+            return complete(dict(saved))
+        spec = {'prompt': batch_prompt(tasks, context), 'control_texts': []}
+        if not resume:
+            request_id = str(context.get('request_id') or uuid.uuid4().hex)
+            spec['marker'] = '【自动化任务标记：' + request_id + '】'
+        else:
+            # Old journals predate markers. Only an exact normalized original
+            # prompt (or an explicitly reconciled message ID) can recover them.
+            for control in baseline.get('controls', []):
+                selected = [t for t in tasks if t['id'] in control.get('task_ids', [])]
+                if selected and len(selected) == len(control.get('task_ids', [])):
+                    windows = '、'.join(f'第{t["seg_index"]+1}段（{t.get("start_seconds",0):g}–{t.get("end_seconds",t["est_seconds"]):g}秒）' for t in selected)
+                    spec['control_texts'].append(f'选择分段分别生成的方案，不压缩整片。确认按上面的原始剧本，仅开始{windows}，各自独立提供视频。其他窗口不要生成。')
+        return complete(spec)
+
     def _save_batch_debug(self, context, reply=''):
         if not context.get('request_id'):
             return
@@ -159,36 +272,99 @@ class BatchGenerationMixin:
         raise RuntimeError(f'未能确认视频时长已选择15秒且比例为{desired_ratio}，发送前已停止')
 
     def _batch_assets(self):
-        observed=self.page.evaluate('''() => {
+        observed=self.page.evaluate('''ownership => {
+          const norm = text => String(text || '').replace(/\\s+/g, '');
+          const canonical = [...document.querySelectorAll('[data-testid="send_message"], [data-testid="receive_message"]')];
+          const messages = canonical.length ? canonical :
+            [...document.querySelectorAll('[data-message-role="user"], [data-message-role="assistant"], [data-role="user"], [data-role="assistant"]')]
+              .filter((node, index, all) => !all.some((other, j) => j !== index && other.contains(node)));
+          const user = node => node.matches('[data-testid="send_message"], [data-message-role="user"], [data-role="user"]');
+          const id = node => node.closest('[data-message-id]')?.getAttribute('data-message-id') || node.id || '';
+          const owns = node => {
+            if (!user(node)) return false;
+            if (ownership.user_message_id) return id(node) === ownership.user_message_id;
+            const text = norm(node.querySelector('[data-testid="message_text_content"]')?.innerText || node.innerText);
+            return ownership.marker ? text.includes(norm(ownership.marker)) &&
+              (!ownership.prompt || text.includes(norm(ownership.prompt))) :
+              Boolean(ownership.prompt && text.includes(norm(ownership.prompt)));
+          };
+          let anchors = messages.filter(owns), anchorKind='original';
+          if (!anchors.length && ownership.user_message_id && ownership.chat_path === location.pathname && ownership.prompt) {
+            // A reload can replace a DOM-only node ID. The complete original
+            // prompt must still match uniquely in the same locked chat.
+            anchors = messages.filter(node => user(node) &&
+              norm(node.querySelector('[data-testid="message_text_content"]')?.innerText || node.innerText).includes(norm(ownership.prompt)) &&
+              (!ownership.marker || norm(node.innerText).includes(norm(ownership.marker))));
+          }
+          // No authenticated ownership proof means no asset, including when
+          // old history hydrates after an apparently empty composer.
+          const empty = {cards:[], assets:[], owner_found:false, route_ready:false, latest_reply:''};
+          if (!anchors.length && ownership.allow_verified_control_anchor === true &&
+              ownership.chat_path === location.pathname && /^\\/chat\\/\\d+\\/?$/.test(location.pathname)) {
+            // Virtual lists can unmount the original prompt. Only a prior
+            // complete-prompt proof in this exact chat permits the latest
+            // registered control turn to stand in for it. Marker-only and
+            // partial control text never establish ownership.
+            const control = norm((ownership.control_texts || []).at(-1));
+            if (control) {
+              anchors = messages.filter(node => user(node) &&
+                norm(node.querySelector('[data-testid="message_text_content"]')?.innerText || node.innerText) === control);
+              anchorKind='verified_control';
+            }
+          }
+          if (anchors.length !== 1) return empty;
+          const anchor = anchors[0], anchorIndex = messages.indexOf(anchor);
+          const originalUserID = anchorKind === 'original' ? id(anchor) : (ownership.user_message_id || '');
+          const routeReady = /^\\/chat\\/\\d+\\/?$/.test(location.pathname) &&
+            (!ownership.chat_path || ownership.chat_path === location.pathname);
+          const metadata = {owner_found:true, route_ready:routeReady, user_message_id:originalUserID,
+                            anchor_kind:anchorKind, control_message_id:anchorKind === 'verified_control' ? id(anchor) : '',
+                            chat_path:location.pathname, latest_reply:''};
+          if (!routeReady) return {...empty, ...metadata};
+          const allowed = (ownership.control_texts || []).map(norm);
+          const received=[]; let latestOwned=null;
+          for (const node of messages.slice(anchorIndex + 1)) {
+            if (user(node)) {
+              const text=norm(node.querySelector('[data-testid="message_text_content"]')?.innerText || node.innerText);
+              if (!allowed.some(value => value && text === value)) break;
+            } else received.push(node);
+            latestOwned=node;
+          }
+          // A confirmation user turn can be mounted before its answer. Do
+          // not act again on the assistant confirmation that preceded it.
+          metadata.latest_reply = latestOwned && !user(latestOwned) ? latestOwned.innerText : '';
+          metadata.latest_reply_message_id = latestOwned && !user(latestOwned) ? id(latestOwned) : '';
           const cards=[];
           const selector='[class*="block-video-"],[class*="fulfill-video-error-box-"]';
-          for(const [receive_index,message] of [...document.querySelectorAll('[data-testid="receive_message"]')].entries()) {
+          for(const message of received) {
             const nodes=[...message.querySelectorAll(selector)];
             for(const [card_ordinal,node] of nodes.entries()) {
-              const message_id=node.closest('[data-message-id]')?.getAttribute('data-message-id')||'';
+              const message_id=id(node);
+              if (!message_id) continue;
               const status=String(node.className).includes('fulfill-video-error-box-')?'failed':'ready';
               const video=node.querySelector('video');
               const url=video?.currentSrc||video?.src||'';
-              const stable='card:'+message_id+':'+card_ordinal;
+              const stable='card:'+location.pathname+':'+message_id+':'+card_ordinal;
               cards.push({kind:'card',status,stable,url,poster:node.querySelector('img')?.src||'',
-                message_id,card_message_id:message_id,card_ordinal,receive_index,card_position:cards.length,
+                message_id,card_message_id:message_id,card_ordinal,card_position:cards.length,
+                ownership_verified:true,owner_user_message_id:originalUserID,
                 duration:Number.isFinite(video?.duration)?video.duration:0});
             }
           }
-          if(cards.length) return {cards,assets:cards.filter(c=>c.status==='ready')};
+          if(cards.length) return {...metadata,cards,assets:cards.filter(c=>c.status==='ready')};
           const seen=new Set(), result=[];
-          for(const [index,v] of [...document.querySelectorAll('video')].entries()) {
+          for(const message of received) for(const [ordinal,v] of [...message.querySelectorAll('video')].entries()) {
             const url=v.currentSrc||v.src||v.querySelector('source')?.src||'';
             if(!url || !Number.isFinite(v.duration) || v.duration<=0) continue;
             const stable=url.split('?')[0]; if(seen.has(stable)) continue; seen.add(stable);
-            const message=v.closest('[data-message-id],[data-testid*="message"]');
-            const siblings=message?[...message.querySelectorAll('video')]:[];
-            result.push({url,stable,video_index:index,message_ordinal:siblings.indexOf(v),
-              message_id:message?.getAttribute('data-message-id')||message?.id||'',
+            const message_id=id(v); if (!message_id) continue;
+            result.push({url,stable,message_ordinal:ordinal,message_id,
+              ownership_verified:true,owner_user_message_id:originalUserID,
               duration:Number.isFinite(v.duration)?v.duration:0});
           }
-          return {cards:[],assets:result};
-        }''')
+          return {...metadata,cards:[],assets:result};
+        }''', getattr(self, '_batch_ownership', {}))
+        self._batch_scope_state=observed
         self._batch_cards_snapshot=observed['cards']
         return observed['assets']
 
@@ -197,6 +373,10 @@ class BatchGenerationMixin:
         return hashlib.sha256(value.encode('utf-8')).hexdigest()
 
     def _assistant_text(self):
+        scope = getattr(self, '_batch_scope_state', None)
+        if scope is not None:
+            self._last_reply_source='latest_assistant'
+            return scope.get('latest_reply', '') if scope.get('owner_found') and scope.get('route_ready') else ''
         selectors = ('[data-testid="receive_message"]', '[data-message-role="assistant"]',
                      '[data-role="assistant"]', '[data-testid*="assistant"]', '[class*="message-receive"]')
         for selector in selectors:
@@ -219,6 +399,16 @@ class BatchGenerationMixin:
         return text[common:][-7000:]
 
     def _download_batch_asset(self, asset, dest):
+        # Old global video indexes and unverified saved references are not
+        # sufficient evidence that a file belongs to this request.
+        if asset.get('ownership_verified') is not True:
+            return False
+        message_id = asset.get('card_message_id') or asset.get('message_id')
+        if not message_id:
+            return False
+        message = self.page.locator('[data-message-id=' + json.dumps(str(message_id)) + ']')
+        if message.count() != 1:
+            return False
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
         temporary = dest.with_suffix('.downloading.mp4')
@@ -226,17 +416,20 @@ class BatchGenerationMixin:
         if asset.get('kind')=='card' and not src:
             selector='[class*="block-video-"],[class*="fulfill-video-error-box-"]'
             try:
-                message=self.page.locator('[data-testid="receive_message"]').nth(asset['receive_index'])
                 card=message.locator(selector).nth(asset['card_ordinal'])
+                if card.count() != 1:
+                    return False
                 if card.get_attribute('class').find('fulfill-video-error-box-')>=0:
                     return False
                 previous=self.page.evaluate("()=>[...document.querySelectorAll('video')].map(v=>v.currentSrc||v.src||'')")
                 card.click(timeout=4000)
                 self.page.wait_for_function("()=>[...document.querySelectorAll('video')].some(v=>v.currentSrc||v.src)",timeout=20000)
                 candidates=self.page.evaluate("()=>[...document.querySelectorAll('video')].map((v,index)=>({url:v.currentSrc||v.src||'',video_index:index,duration:Number.isFinite(v.duration)?v.duration:0})).filter(v=>v.url)")
-                chosen=next((v for v in candidates if v['url'] not in previous),candidates[-1] if candidates else None)
-                if chosen:
-                    asset.update(chosen);src=chosen['url']
+                fresh=[v for v in candidates if v['url'] not in previous]
+                if len(fresh) != 1:
+                    return False
+                chosen=fresh[0]
+                asset.update(chosen);src=chosen['url']
             except Exception:
                 return False
         if src.startswith(('https://', 'http://')):
@@ -248,16 +441,18 @@ class BatchGenerationMixin:
                     return True
             except Exception:
                 pass
-        videos = self.page.locator(self.sel.get('video_card', 'video'))
-        index = asset.get('video_index', -1)
-        if not 0 <= index < videos.count():
+        videos = self.page.locator('video')
+        matching=[i for i in range(videos.count()) if videos.nth(i).evaluate("v=>v.currentSrc||v.src||''") == src]
+        if len(matching) != 1:
             return False
-        video = videos.nth(index)
+        video = videos.nth(matching[0])
         try:
             video.hover(timeout=2000)
             card = video
-            for _ in range(7):
+            for _ in range(3):
                 card = card.locator('..')
+                if card.evaluate("e=>['BODY','HTML'].includes(e.tagName)"):
+                    break
                 if card.locator('video').count() > 1:
                     break
                 for selector in self.sel.get('download_button', []):
@@ -284,19 +479,25 @@ class BatchGenerationMixin:
                   'continuation_safe': False, 'quota_remaining': None}
         resume = bool(context.get('resume_only'))
         baseline = dict(context.get('baseline') or {})
+        self._batch_scope_state = None
+        self._batch_ownership = self._ownership_spec(tasks, context, baseline, resume)
+        baseline['ownership'] = self._batch_ownership
         known = {tid: ref for tid, ref in result['remote_refs'].items()
                  if isinstance(ref, dict) and ref.get('key') and (ref.get('url') or ref.get('card_message_id'))}
         result['remote_refs'] = dict(known)
+        download_bindings = dict(context.get('remote_refs') or {})
         accounted = set()
         one_at_time, single_followups, control_phases = False, set(), set()
         remote_started = False
-        last_reply, last_url = '', result['chat_url']
+        last_url, last_reply_identity = result['chat_url'], ''
         try:
             if resume:
                 target = context.get('chat_url', '')
                 parsed = urlsplit(target)
-                if parsed.hostname not in ('www.doubao.com', 'doubao.com') or parsed.path.rstrip('/') in ('', '/chat'):
-                    result.update(error_kind='needs_user', error='原请求缺少可恢复的对话地址，禁止重复发送')
+                result['submitted'] = True
+                if (parsed.hostname not in ('www.doubao.com', 'doubao.com')
+                        or not re.fullmatch(r'/chat/\d+/?', parsed.path)):
+                    result.update(error_kind='needs_user', error='原请求缺少正式数字ID的豆包对话地址（临时 local_ 路由不可恢复）；请核对原会话正式地址，已保留请求，禁止重复发送')
                     return result
                 self.page.goto(target, wait_until='domcontentloaded')
                 self.page.wait_for_timeout(3000)
@@ -313,7 +514,7 @@ class BatchGenerationMixin:
                 # A whole-page search could match a user's prompt or old chat.
                 # Only inspect an explicitly configured visible balance element.
                 observed = None
-                balance_selector = self.sel.get('quota_balance')
+                balance_selector = getattr(self, 'sel', {}).get('quota_balance')
                 if balance_selector:
                     selector = balance_selector if isinstance(balance_selector, str) else ', '.join(balance_selector)
                     try:
@@ -329,34 +530,76 @@ class BatchGenerationMixin:
                 assets = self._batch_assets()
                 baseline = {'keys': [self._key_asset(a) for a in assets], 'assets': assets,
                             'body': self._batch_body_before, 'controls': [],
-                            'card_count':len(getattr(self,'_batch_cards_snapshot',[]))}
+                            'card_count':len(getattr(self,'_batch_cards_snapshot',[])),
+                            'ownership':self._batch_ownership, 'scope_version':1}
                 baseline['assistant_before']=self._assistant_text()
                 prompt = batch_prompt(tasks, context)
+                prompt += '\n' + self._batch_ownership['marker']
+                prompt += '\n此标记仅用于自动化定位，不得出现在生成内容、视频画面、字幕或口播中。'
                 self._batch_sent_prompt = prompt
                 # Persist uncertainty BEFORE the potentially successful click.
-                on_submitted(self.page.url, baseline)
-                result.update(submitted=True, chat_url=self.page.url)
+                # The old page URL can still identify the previous chat during
+                # SPA navigation. Save it only after this exact user turn exists.
+                on_submitted('', baseline)
+                result.update(submitted=True, chat_url='')
+                last_url = ''
                 self.type_and_send(prompt)
                 self._save_batch_debug(context)
             self._batch_body_before = baseline.get('body', '')
             baseline_keys = set(baseline.get('keys', []))
             timeout = float(self.dcfg.get('generation_timeout_minutes', 25)) * 60
+            ack_timeout = max(0, float(self.dcfg.get('ownership_ack_timeout_seconds', 180)))
+            ownership_wait_started = None
             deadline, last_log = time.monotonic() + timeout, 0
             while time.monotonic() < deadline:
                 self._assert_logged_in()
                 self._handle_dialogs()
-                if self.page.url != last_url:
+                assets = self._batch_assets()
+                scope = getattr(self, '_batch_scope_state', None)
+                ownership_changed = False
+                if scope is not None:
+                    if not scope.get('owner_found') or not scope.get('route_ready'):
+                        now = time.monotonic()
+                        if ownership_wait_started is None:
+                            ownership_wait_started = now
+                        if now - ownership_wait_started >= ack_timeout:
+                            detail = '本次用户消息定位' if not scope.get('owner_found') else '正式数字ID对话路由确认'
+                            error = f'{detail}超过{ack_timeout:g}秒仍未就绪；已停止等待并保留原请求，请核对原会话后恢复，禁止盲目重发'
+                            self._save_batch_debug(context,error)
+                            result.update(error_kind='needs_user', error=error, continuation_safe=False)
+                            return result
+                        remaining = ack_timeout - (now - ownership_wait_started)
+                        self.page.wait_for_timeout(max(1, int(min(float(self.dcfg.get('poll_interval_seconds',5)),remaining)*1000)))
+                        continue
+                    ownership_wait_started = None
+                    if baseline.get('scope_version') != 1:
+                        baseline['unscoped_history'] = {k:baseline.get(k) for k in ('keys','assets','card_count')}
+                        baseline.update(keys=[], assets=[], card_count=0, scope_version=1)
+                        baseline_keys = set()
+                    self._batch_ownership.update(chat_path=scope['chat_path'])
+                    if scope.get('anchor_kind') == 'original':
+                        proof = self._original_anchor_proof(self._batch_ownership, scope['chat_path'])
+                        ownership_changed |= self._batch_ownership.get('original_anchor_proof') != proof
+                        self._batch_ownership['original_anchor_proof'] = proof
+                        self._batch_ownership['allow_verified_control_anchor'] = len(self._batch_ownership.get('task_ids', [])) == 1
+                    if scope.get('user_message_id') and scope.get('anchor_kind') == 'original':
+                        ownership_changed |= self._batch_ownership.get('user_message_id') != scope['user_message_id']
+                        self._batch_ownership['user_message_id'] = scope['user_message_id']
+                    ownership_changed |= self._batch_ownership.get('last_anchor_kind') != scope.get('anchor_kind')
+                    self._batch_ownership['last_anchor_kind'] = scope.get('anchor_kind')
+                if self.page.url != last_url or ownership_changed or (scope is not None and baseline.get('ownership_acknowledged') is not True):
                     last_url = self.page.url
+                    if scope is not None:
+                        baseline['ownership_acknowledged'] = True
                     on_submitted(last_url, baseline)
                     result['chat_url'] = last_url
-                assets = self._batch_assets()
                 cards=getattr(self,'_batch_cards_snapshot',[])
                 original_ids=context.get('original_task_ids') or context.get('task_ids') or [t['id'] for t in tasks]
                 card_offset=int(baseline.get('card_count',0))
                 failed_ids=[original_ids[c['card_position']-card_offset] for c in cards
                             if c['status']=='failed' and 0<=c['card_position']-card_offset<len(original_ids)]
                 failed_ids=[tid for tid in failed_ids if any(t['id']==tid for t in tasks)]
-                if resume and not assets and not cards:
+                if resume and not assets and not cards and scope is None:
                     self.page.wait_for_timeout(int(float(self.dcfg.get('poll_interval_seconds',5))*1000))
                     continue
                 by_key = {self._key_asset(a): a for a in assets}
@@ -382,8 +625,9 @@ class BatchGenerationMixin:
                     if ref and ref.get('key') in by_key:
                         known[task['id']] = dict(by_key[ref['key']], key=ref['key'])
                     elif resume and ref:
+                        ordinal = 'card_ordinal' if ref.get('kind') == 'card' else 'message_ordinal'
                         matches=[a for a in assets if ref.get('message_id') and a.get('message_id')==ref['message_id']
-                                 and a.get('message_ordinal')==ref.get('message_ordinal')]
+                                 and a.get(ordinal)==ref.get(ordinal)]
                         if len(matches)==1:
                             known[task['id']]=dict(matches[0],key=self._key_asset(matches[0]))
                         else:
@@ -415,11 +659,15 @@ class BatchGenerationMixin:
                         on_generated(tid, ref)
                         accounted.add(tid)
                     result['remote_refs'][tid] = ref
-                    if destination.is_file() and destination.stat().st_size > 1000:
+                    if self._bound_download_matches(destination, ref, download_bindings.get(tid)):
                         result['videos'][tid] = str(destination)
-                    elif self._download_batch_asset(ref, destination):
-                        result['videos'][tid] = str(destination)
-                        print(f'[{self.name}] 分段已下载 {task["seg_index"]+1}/{task["seg_total"]}: {destination.name}', flush=True)
+                    else:
+                        self._preserve_unbound_download(destination)
+                        if self._download_batch_asset(ref, destination):
+                            self._bind_download(destination, ref)
+                            download_bindings[tid] = dict(ref)
+                            result['videos'][tid] = str(destination)
+                            print(f'[{self.name}] 分段已下载 {task["seg_index"]+1}/{task["seg_total"]}: {destination.name}', flush=True)
                     if ref.get('kind')=='card' and ref.get('url'):
                         try:self.page.keyboard.press('Escape')
                         except Exception:pass
@@ -444,22 +692,36 @@ class BatchGenerationMixin:
                                     active=False,source='latest_assistant',quota_not_charged=True,failed_task_ids=failed_ids))
                     self._save_batch_debug(context,reply)
                     return result
-                if not resume and reply and reply != last_reply:
+                reply_identity = (scope or {}).get('latest_reply_message_id') or reply
+                if reply and reply_identity != last_reply_identity:
                     missing_tasks = [t for t in tasks if t['id'] not in known]
                     phase = 'initial' if not known else ','.join(t['id'] for t in missing_tasks)
                     explicit_remaining = bool(known) and bool(re.search(r'(第二|第2|下一|另一)[^。\n]{0,24}(?:是否|需要|确认|继续)|(?:是否|确认|继续)[^。\n]{0,24}(第二|第2|下一|另一)',reply))
                     if (action in ('split','confirm','single') and missing_tasks and not active
-                            and (not remote_started or explicit_remaining) and phase not in control_phases):
+                            and (resume or phase in control_phases or not remote_started or explicit_remaining)):
+                        if resume or phase in control_phases:
+                            self._save_batch_debug(context,reply)
+                            result.update(error_kind='needs_user', continuation_safe=False,
+                                          error=('原请求仍等待平台确认；恢复模式不会发送消息，请在原会话明确确认开始后再继续'
+                                                 if resume else '已发送一次明确开始生成指令，平台仍要求确认；已停止自动确认，请在原会话人工核对，尚未领取任何未确认产物'))
+                            return result
                         control_phases.add(phase)
                         one_at_time |= action=='single' and not remote_started
                         follow_tasks = missing_tasks[:1] if one_at_time else missing_tasks
                         windows='、'.join(f'第{t["seg_index"]+1}段（{t.get("start_seconds",0):g}–{t.get("end_seconds",t["est_seconds"]):g}秒）' for t in follow_tasks)
-                        clarification=f'选择分段分别生成的方案，不压缩整片。确认按上面的原始剧本，仅开始{windows}，各自独立提供视频。其他窗口不要生成。'
+                        clarification=f'确认，立即开始生成上述{windows}的独立视频，严格沿用上面的原始剧本和已选择的视频参数。'
+                        if action == 'split':
+                            clarification += '已选择分段分别生成，不压缩整片。'
+                        clarification += f'本次仅生成这{len(follow_tasks)}条，各自独立提供视频；其他窗口不要生成，不再重复列参数或询问确认。'
+                        if self._batch_ownership.get('marker'):
+                            clarification += '\n' + self._batch_ownership['marker']
+                            clarification += '\n此标记仅用于自动化定位，不得出现在生成内容、视频画面、字幕或口播中。'
+                        self._batch_ownership.setdefault('control_texts', []).append(clarification)
                         baseline['controls'].append({'phase':phase,'task_ids':[t['id'] for t in follow_tasks]})
                         if known and one_at_time:
                             single_followups.update(t['id'] for t in follow_tasks)
                         on_submitted(self.page.url,baseline)
-                        last_reply = reply
+                        last_reply_identity = reply_identity
                         self.type_and_send(clarification)
                         self._batch_sent_prompt = clarification
                 if (not resume and one_at_time and result['videos'] and len(known) < len(tasks) and not active):
@@ -467,8 +729,13 @@ class BatchGenerationMixin:
                     if next_task['id'] not in single_followups:
                         single_followups.add(next_task['id'])
                         baseline['controls'].append({'phase':'single_next','task_ids':[next_task['id']]})
+                        followup = '前一条已经完成。现在仅生成下一条独立视频：\n' + batch_prompt([next_task], context)
+                        if self._batch_ownership.get('marker'):
+                            followup += '\n' + self._batch_ownership['marker']
+                            followup += '\n此标记仅用于自动化定位，不得出现在生成内容、视频画面、字幕或口播中。'
+                        self._batch_ownership.setdefault('control_texts', []).append(followup)
                         on_submitted(self.page.url,baseline)
-                        self.type_and_send('前一条已经完成。现在仅生成下一条独立视频：\n' + batch_prompt([next_task], context))
+                        self.type_and_send(followup)
                         deadline = time.monotonic() + timeout
                 if not any(k in reply for k in ('正在生成', '生成中', '排队', '预计等待')):
                     if (not action and not active and getattr(self,'_last_reply_source','')=='latest_assistant'

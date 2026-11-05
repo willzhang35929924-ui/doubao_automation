@@ -35,7 +35,8 @@ class QueueTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory(dir=ROOT/'.tmp');self.root=Path(self.tmp.name)
         self.workspace=self.root/'workspace';self.videos=self.workspace/'videos';self.videos.mkdir(parents=True)
         self.source=self.videos/'source.mp4';self.source.write_bytes(b'original source')
-        python=self.root/'third_party/video-subtitle-remover/.venv/Scripts/python.exe';python.parent.mkdir(parents=True);python.write_bytes(b'fake')
+        executable = 'Scripts/python.exe' if pp.os.name == 'nt' else 'bin/python'
+        python=self.root/'third_party/video-subtitle-remover/.venv'/executable;python.parent.mkdir(parents=True);python.write_bytes(b'fake')
         runner=self.workspace/'postprocess_setup/vsr_run.py';runner.parent.mkdir(parents=True);runner.write_text('')
         (runner.parent/'vsr_ready.json').write_text('{"ready":true}')
         model=self.root/'model';model.write_text('fake model')
@@ -59,6 +60,14 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(len(pp.store().snapshot()['jobs']),1)
         self.assertEqual(self.source.read_bytes(),b'original source')
         self.assertTrue(pp.busy())
+
+    def test_missing_vsr_dependencies_prevent_submission(self):
+        python, _ = pp._vsr_paths()
+        python.unlink()
+        with self.assertRaisesRegex(ValueError, '发布副本未包含'):
+            pp.submit(self.source)
+        pp.ensure_worker.assert_not_called()
+        self.assertFalse(pp.STORE_PATH.exists())
 
     def test_failed_retry_new_job_and_done_output_reuse(self):
         a=pp.submit(self.source);pp.update(a['id'],status='failed',error='GPU error')

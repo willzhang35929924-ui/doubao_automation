@@ -58,8 +58,7 @@ class Page:
 
 class GeminiRuntimeTests(unittest.TestCase):
     def setUp(self):
-        (ROOT/'.tmp').mkdir(exist_ok=True)
-        self.temp=tempfile.TemporaryDirectory(dir=ROOT/'.tmp',prefix='gemini_runtime_')
+        self.temp=tempfile.TemporaryDirectory(prefix='gemini_runtime_')
         self.addCleanup(self.temp.cleanup)
         self.page=Page()
         self.cfg={'gemini':{'audit_dir':self.temp.name,'response_stable_seconds':1,
@@ -139,6 +138,36 @@ class GeminiRuntimeTests(unittest.TestCase):
         self.assertEqual(self.page.clicked.count('send'),1)
         self.page.keyboard.press.assert_not_called()
 
+    def test_prompt_draft_is_filled_before_waiting_for_video_upload(self):
+        calls=Mock()
+        for method in ('open','type_prompt','upload_files','send_prompt','wait_response'):
+            mocked=Mock(return_value='fixture response' if method=='wait_response' else None)
+            setattr(self.agent,method,mocked)
+            calls.attach_mock(mocked,method)
+        self.agent.generate(['fixture.mp4'],'fixture instruction')
+        self.assertEqual([call[0] for call in calls.mock_calls],
+                         ['open','type_prompt','upload_files','send_prompt','wait_response'])
+        self.assertIn('fixture instruction',self.agent.type_prompt.call_args.args[0])
+        self.assertEqual(self.agent.type_prompt.call_args.args,self.agent.send_prompt.call_args.args)
+
+    def test_generate_does_not_allow_retry_after_an_attempted_send(self):
+        self.agent.open=Mock()
+        def attempted_send(_):
+            self.agent._submission_attempted=True
+            raise GeminiError('未确认新消息')
+        self.agent.send_prompt=Mock(side_effect=attempted_send)
+        with self.assertRaisesRegex(module.GeminiSubmissionUncertain,'停止自动重试'):
+            self.agent.generate([], 'fixture')
+        self.agent.send_prompt.assert_called_once()
+
+    def test_failure_before_send_remains_a_retryable_gemini_error(self):
+        self.agent.open=Mock(side_effect=GeminiError('fixture editor not ready'))
+        self.agent.send_prompt=Mock()
+        with self.assertRaises(GeminiError) as error:
+            self.agent.generate([], 'fixture')
+        self.assertNotIsInstance(error.exception,module.GeminiSubmissionUncertain)
+        self.agent.send_prompt.assert_not_called()
+
     def test_wait_never_returns_old_stable_response(self):
         old=snapshot(['old answer'])
         self.agent._sent_baseline=old
@@ -212,6 +241,57 @@ class GeminiRuntimeTests(unittest.TestCase):
         self.assertEqual(module._requested_durations('生成1个50秒和一个70秒的视频'),[50,70])
         self.assertEqual(module._requested_durations('Script 01=20秒\n【本次附加提示词】\nScript 01=50秒；Script 02=70秒'),[50,70])
         self.assertEqual(module._requested_durations('生成1个50秒和一个70秒的视频',1),[])
+
+    def test_supplemental_single_fifteen_seconds_overrides_fixed_long_versions(self):
+        message=('帮我再写1个50秒和一个70秒的TIKTOK爆款短视频脚本'
+                 '\n【本次附加提示词】\n帮我再写1个15秒的TIKTOK爆款短视频脚本')
+        self.assertEqual(module._explicit_script_count(message),1)
+        self.assertEqual(module._requested_durations(message,1),[15])
+        self.agent.open=Mock();self.agent.send_prompt=Mock()
+        self.agent.wait_response=Mock(return_value=script_fixture(1,15))
+        self.agent.generate([],message)
+        instructions=self.agent.send_prompt.call_args.args[0].split('【自动化脚本输出规范】',1)[1]
+        self.assertIn('本次最终只输出1个脚本',instructions)
+        self.assertIn('本次各脚本总时长按顺序为15秒',instructions)
+        self.assertNotIn('50秒',instructions)
+        self.assertNotIn('70秒',instructions)
+
+    def test_single_requested_duration_is_checked_not_only_script_count(self):
+        self.agent.open=Mock();self.agent.send_prompt=Mock()
+        self.agent.wait_response=Mock(return_value=script_fixture(1,50))
+        with self.assertRaisesRegex(GeminiError,'总时长不符.*15.*50'):
+            self.agent.generate([], '帮我再写1个15秒的视频脚本')
+
+    def test_one_of_each_duration_is_two_scripts_not_one_total(self):
+        message='帮我再写1个50秒和一个70秒的TIKTOK爆款短视频脚本'
+        self.assertEqual(module._explicit_script_count(message),2)
+        self.assertEqual(module._requested_durations(message,2),[50,70])
+
+    def test_no_duration_request_does_not_add_arbitrary_long_versions(self):
+        self.agent.open=Mock();self.agent.send_prompt=Mock()
+        self.agent.wait_response=Mock(return_value=script_fixture(1,15))
+        self.agent.generate([], '请依据素材生成脚本')
+        instructions=self.agent.send_prompt.call_args.args[0].split('【自动化脚本输出规范】',1)[1]
+        self.assertNotIn('50秒',instructions)
+        self.assertNotIn('70秒',instructions)
+
+    def test_repeated_fifteen_second_request_overrides_old_durations(self):
+        message=('生成1个50秒和一个70秒的视频\n【本次附加提示词】\n'
+                 '帮我再写4个15秒的TIKTOK爆款短视频脚本')
+        self.assertEqual(module._explicit_script_count(message),4)
+        self.assertEqual(module._requested_durations(message,4),[15]*4)
+        self.assertEqual(module._requested_durations('写四个15秒的视频脚本'),[15]*4)
+        self.assertEqual(module._requested_durations(message,3),[])
+        self.agent.open=Mock();self.agent.send_prompt=Mock()
+        raw='\n'.join(script_fixture(index,15) for index in range(1,5))
+        self.agent.wait_response=Mock(return_value=raw)
+        self.assertEqual(self.agent.generate([],message),raw)
+        self.agent.wait_response=Mock(return_value=raw.replace(script_fixture(4,15),script_fixture(4,50)))
+        with self.assertRaisesRegex(GeminiError,'总时长不符'):
+            self.agent.generate([],message)
+
+    def test_segment_duration_is_not_mistaken_for_total_duration(self):
+        self.assertEqual(module._requested_durations('生成3个脚本，每条包含15秒分段',3),[])
 
     def test_natural_language_fifty_and_seventy_seconds_are_validated(self):
         raw=script_fixture(1,50)+'\n'+script_fixture(2,70)

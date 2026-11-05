@@ -19,6 +19,7 @@ class RunResumeTests(unittest.TestCase):
         self.directory=Path(self.tmp.name)
         self.logs=self.directory/'logs';self.logs.mkdir()
         self.videos=self.directory/'videos';self.videos.mkdir()
+        self.cfg={'accounts':{'doubao':[dict(name='fixture',profile='profiles/fixture')]}}
         self.child=Mock(pid=321)
         self.child.poll.return_value=None
         self.patches=[patch.object(dashboard,'STATE_DIR',self.directory),
@@ -28,7 +29,8 @@ class RunResumeTests(unittest.TestCase):
                       patch.object(dashboard.threading,'Thread'),
                       patch.object(dashboard.subprocess,'Popen',return_value=self.child),
                       patch.object(dashboard.postprocess,'busy',return_value=False),
-                      patch.object(dashboard.postprocess,'STORE_PATH',self.directory/'postprocess.json')]
+                      patch.object(dashboard.postprocess,'STORE_PATH',self.directory/'postprocess.json'),
+                      patch.object(dashboard,'load_config',return_value=self.cfg)]
         self.mocks=[item.start() for item in self.patches]
         self.popen=self.mocks[6]
         self.client=dashboard.app.test_client()
@@ -54,6 +56,23 @@ class RunResumeTests(unittest.TestCase):
 
     def post(self,count=9):
         return self.client.post('/api/run',json={'task_count':count})
+
+    def test_missing_or_disabled_accounts_block_launch_without_mutating_saved_work(self):
+        for accounts in ([], [dict(name='fixture',profile='profiles/fixture',enabled=False)]):
+            for resumed in (False,True):
+                with self.subTest(accounts=accounts,resumed=resumed):
+                    self.cfg['accounts']['doubao']=accounts
+                    data=copy.deepcopy(self.original)
+                    if not resumed:data.update(scripts=[],tasks=[],requests={},assemblies={})
+                    self.state.reset(data)
+                    ledger=self.ledger.snapshot()
+                    response=self.post()
+                    self.assertEqual(response.status_code,400)
+                    self.assertIn('账号库',response.json['error'])
+                    self.assertEqual(self.state.snapshot(),data)
+                    self.assertEqual(self.ledger.snapshot(),ledger)
+                    self.assertEqual(self.log.read_text(encoding='utf-8'),'original log\n')
+                    self.popen.assert_not_called()
 
     def test_incomplete_plan_preserves_journal_count_ledger_and_appends_log(self):
         before_ledger=self.ledger.snapshot()

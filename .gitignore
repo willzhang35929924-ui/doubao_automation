@@ -109,3 +109,15 @@ dist/
 # 第三方项目自带的测试媒体和演示动画
 /third_party/video-subtitle-remover/test/*.mp4
 /third_party/video-subtitle-remover/design/*.gif
+
+/.startup-backups/
+
+/.startup-logs/
+
+/.local-routing/
+
+# Machine-only overrides, diagnostics and local verification reports
+/compose.local.yaml
+/graphify-out/
+/*_FIX.md
+/*_VERIFIED*.md

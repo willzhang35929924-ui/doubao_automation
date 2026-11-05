@@ -53,6 +53,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='Doubao Automation 本地控制')
     parser.add_argument('action', choices=('start', 'stop', 'status', 'preview-clear', 'clear-history'))
     args = parser.parse_args(argv)
+    if sys.platform == 'darwin':
+        # Status/preview must select the same data directory as the starter.
+        from scripts.macos_bootstrap import configure_data_environment
+        configure_data_environment()
     if args.action in ('preview-clear', 'clear-history'):
         script = ROOT / 'scripts' / 'clear_history.py'
         if not script.is_file():
@@ -60,6 +64,10 @@ def main(argv=None):
         action = 'preview' if args.action == 'preview-clear' else 'clear'
         return subprocess.run([sys.executable, str(script), action], cwd=ROOT).returncode
     if args.action == 'start':
+        if sys.platform == 'darwin':
+            from scripts.macos_bootstrap import start_dashboard
+            start_dashboard(check_start_requirements)
+            return 0
         check_start_requirements()
         import launch_dashboard
         launch_dashboard.main()

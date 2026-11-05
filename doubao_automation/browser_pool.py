@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from .config import get
+from .browser_runtime import resolve_browser_runtime
 from .paths import PROFILES, resolve
 
 
@@ -40,45 +41,47 @@ class BrowserSession:
             if self.context is not None:
                 return self
             self._pw = sync_playwright().start()
-            kwargs = dict(
-                user_data_dir=str(self.profile_dir),
-                headless=bool(get(self.cfg, "browser.headless", False)),
-                args=self._chrome_args(),
-                no_viewport=True,
-                accept_downloads=True,
-                locale=get(self.cfg, "browser.locale", "zh-CN"),
-                timeout=60000,
-            )
-            timeout_ms = int(get(self.cfg, "browser.default_timeout_ms", 30000))
-            default_channel = "chrome" if sys.platform == "win32" else None
-            channel = get(self.cfg, "browser.channel", default_channel)
-            # Chromium refers to Playwright's installed browser, not a channel.
-            if channel in ("", "chromium"):
-                channel = None
-            if channel:
-                kwargs["channel"] = channel
             try:
-                self.context = self._pw.chromium.launch_persistent_context(**kwargs)
-            except Exception as exc:
-                exc_str = str(exc).lower()
-                if any(token in exc_str for token in ('processsingleton', 'already in use', 'currently in use')):
-                    self._pw.stop(); self._pw = None
-                    raise RuntimeError(f'[{self.name}] 账号浏览器配置正在使用，请先关闭该账号的已有窗口再重试') from exc
-                # 只有找不到系统浏览器且已安装备用浏览器时才回退，保留实际启动错误。
-                if (channel and 'executable' in exc_str and 'exist' in exc_str
-                        and Path(self._pw.chromium.executable_path).is_file()):
-                    try:
-                        kwargs.pop("channel", None)
+                runtime = resolve_browser_runtime(self.cfg, self._pw.chromium.executable_path)
+                if not runtime['available']:
+                    raise RuntimeError(runtime['error'])
+                kwargs = dict(
+                    user_data_dir=str(self.profile_dir),
+                    headless=bool(get(self.cfg, "browser.headless", False)),
+                    args=self._chrome_args(),
+                    no_viewport=True,
+                    accept_downloads=True,
+                    locale=get(self.cfg, "browser.locale", "zh-CN"),
+                    timeout=60000,
+                )
+                timeout_ms = int(get(self.cfg, "browser.default_timeout_ms", 30000))
+                channel = runtime['channel']
+                if channel:
+                    kwargs['channel'] = channel
+                try:
+                    self.context = self._pw.chromium.launch_persistent_context(**kwargs)
+                except Exception as exc:
+                    exc_str = str(exc).lower()
+                    if any(token in exc_str for token in ('processsingleton', 'already in use', 'currently in use')):
+                        raise RuntimeError(f'[{self.name}] 账号浏览器配置正在使用，请先关闭该账号的已有窗口再重试') from exc
+                    # Keep the Windows default-channel fallback, but do not
+                    # silently override an explicitly configured browser.
+                    if (channel and not runtime['explicit'] and runtime['managed_available']
+                            and 'executable' in exc_str and 'exist' in exc_str):
+                        kwargs.pop('channel', None)
                         self.context = self._pw.chromium.launch_persistent_context(**kwargs)
-                    except Exception:
-                        self._pw.stop(); self._pw = None
-                        raise
-                else:
-                    self._pw.stop(); self._pw = None
-                    raise RuntimeError(f'[{self.name}] 浏览器启动失败；请检查配置并安装 Playwright Chromium: {exc}') from exc
-            self.context.set_default_timeout(timeout_ms)
-            self.context.set_default_navigation_timeout(max(timeout_ms, 60000))
-            self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+                    else:
+                        raise RuntimeError(f'[{self.name}] 浏览器启动失败：{exc}') from exc
+                self.context.set_default_timeout(timeout_ms)
+                self.context.set_default_navigation_timeout(max(timeout_ms, 60000))
+                self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+                if not kwargs['headless']:
+                    self.page.bring_to_front()
+            except Exception:
+                # Also release the driver/context on invalid settings and
+                # post-launch initialization errors, not only launch failures.
+                self.stop()
+                raise
             if self.start_url:
                 try:
                     self.page.goto(self.start_url, wait_until="domcontentloaded")
@@ -132,26 +135,33 @@ class BrowserSession:
         return any(c.get("name") in names for c in self.cookies(url))
 
     def wait_logged_in(self, url: str, cookie_names, poll_s: float = 5.0,
-                       timeout_s: float = 1800.0, on_status=None, dom_probe=None) -> bool:
+                       timeout_s: float = 1800.0, on_status=None, dom_probe=None,
+                       login_probe=None) -> bool:
         """轮询等待登录成功；返回是否成功。on_status(logged_in: bool) 可回调。
 
-        判定 = cookie 命中 或 dom_probe(page) 返回 True（后备：cookie 名称变化时，
-        用页面 DOM 特征判断，例如"存在聊天输入框且无登录提示"）。
+        login_probe(session) 可提供统一判定；指定后不再被宽松的 cookie/DOM
+        后备规则短路。其他站点仍使用 cookie 命中或 dom_probe(page)。
         """
         deadline = time.time() + timeout_s
         last = None
         while time.time() < deadline:
-            ok = self.has_any_cookie(url, cookie_names)
-            if not ok and dom_probe is not None and self.page is not None:
-                try:
-                    ok = bool(dom_probe(self.page))
-                except Exception:
-                    ok = False
+            if login_probe is not None:
+                ok = bool(login_probe(self))
+            else:
+                ok = self.has_any_cookie(url, cookie_names)
+                if not ok and dom_probe is not None and self.page is not None:
+                    try:
+                        ok = bool(dom_probe(self.page))
+                    except Exception:
+                        ok = False
             if ok != last:
                 last = ok
                 if on_status:
                     on_status(ok)
             if ok:
                 return True
-            time.sleep(poll_s)
+            if self.page is not None and not self.page.is_closed():
+                self.page.wait_for_timeout(poll_s * 1000)
+            else:
+                time.sleep(poll_s)
         return False

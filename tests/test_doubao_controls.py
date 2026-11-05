@@ -23,7 +23,7 @@ class DurationControlTests(unittest.TestCase):
     def setUpClass(cls):
         use_workspace_temp()
         cls.playwright = sync_playwright().start()
-        cls.browser = cls.playwright.chromium.launch(channel='chrome', headless=True)
+        cls.browser = cls.playwright.chromium.launch(headless=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -32,6 +32,7 @@ class DurationControlTests(unittest.TestCase):
 
     def setUp(self):
         self.page = self.browser.new_page()
+        self.page.route('**/*', lambda route: route.abort())
 
     def tearDown(self):
         self.page.close()

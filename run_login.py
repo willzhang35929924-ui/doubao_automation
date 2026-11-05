@@ -10,6 +10,7 @@
 无需重复登录（除非账号过期）。
 """
 import argparse
+import copy
 import sys
 if sys.platform == 'darwin':
     sys.dont_write_bytecode = True
@@ -22,40 +23,34 @@ except Exception:
     pass
 
 from doubao_automation.browser_pool import BrowserSession
-from doubao_automation.config import get, load_config
-from doubao_automation.paths import ensure_dirs, use_workspace_temp
+from doubao_automation.config import get, load_config, save_config
+from doubao_automation.doubao_login import probe_doubao_login
+from doubao_automation.gemini_web import GeminiWeb
+from doubao_automation.account_manager import AccountManager
+from doubao_automation.paths import STATE_DIR, ensure_dirs, use_workspace_temp
+from doubao_automation.state import JsonStore
 
-# 登录提示关键词：页面上出现任何一个都说明还没登录
-_LOGIN_HINTS = ("登录", "扫码", "验证码", "手机号", "注册")
-
-
-def _doubao_probe(page) -> bool:
-    """DOM 后备判定：存在聊天输入框，且页面上没有任何登录提示 → 已登录。
-    （宁可漏判——漏判时仍靠 cookie 判定；不能误判——误判会导致未登录却继续。）"""
-    try:
-        url = (page.url or "").lower()
-        if "login" in url or "passport" in url or "sso" in url:
-            return False
-        if page.locator('div[contenteditable="true"]').count() == 0:
-            return False
-        body = page.locator("body").inner_text(timeout=2000)[:600]
-        return not any(k in body for k in _LOGIN_HINTS)
-    except Exception:
-        return False
+_LOGIN_SAVE_LOCK = threading.Lock()
 
 
-def _gemini_probe(page) -> bool:
-    try:
-        if "accounts.google.com" in (page.url or ""):
-            return False
-        return page.locator(
-            'div.ql-editor[contenteditable="true"], div[contenteditable="true"][role="textbox"]'
-        ).count() > 0
-    except Exception:
-        return False
+def _save_doubao_login(acct):
+    # Concurrent login workers must merge into the latest settings, not the
+    # startup snapshot. Login verification never resets the quota ledger.
+    with _LOGIN_SAVE_LOCK:
+        cfg = load_config()
+        current = next((a for a in get(cfg, 'accounts.doubao', [])
+                        if a['name'] == acct['name'] and a['profile'] == acct['profile']), None)
+        if current is None:
+            raise ValueError('账号配置已改变，请重新打开登录窗口')
+        current['enabled'] = True
+        save_config(cfg)
+        manager = AccountManager(JsonStore(STATE_DIR / 'accounts.json'), [acct['name']])
+        manager.mark_available_after_login(acct['name'])
 
 
 def _worker(acct: dict, kind: str, cfg: dict, result: dict, stop_event: threading.Event):
+    cfg = copy.deepcopy(cfg)
+    cfg['browser'] = dict(cfg.get('browser') or {}, headless=False)
     name = acct["name"]
     if kind == "doubao":
         url = get(cfg, "login.doubao_url", "https://www.doubao.com/chat/")
@@ -67,36 +62,35 @@ def _worker(acct: dict, kind: str, cfg: dict, result: dict, stop_event: threadin
     session = BrowserSession(name, acct["profile"], cfg, start_url=url)
     try:
         session.start()
-    except Exception as e:
-        print(f"[login] ✗ {name} 浏览器启动失败: {e}")
-        result[name] = False
-        return
-
-    if session.has_any_cookie(url, cookies):
-        print(f"[login] ✓ {name} 已有登录态（复用之前保存的会话）")
-        result[name] = True
-    else:
-        print(f"[login] ⏳ {name}: 请在弹出的浏览器窗口中完成登录（扫码/验证码均可）…")
-
-        def on_status(ok):
-            if ok:
-                print(f"[login] ✓ {name} 登录成功！")
-
-        ok = session.wait_logged_in(
-            url, cookies,
-            poll_s=float(get(cfg, "login.poll_interval_seconds", 5)),
-            timeout_s=float(get(cfg, "login.timeout_minutes", 30)) * 60,
-            on_status=on_status,
-            dom_probe=_doubao_probe if kind == "doubao" else _gemini_probe,
-        )
+        if kind == 'doubao':
+            login_probe = lambda sess: probe_doubao_login(sess, cfg)['logged_in']
+        else:
+            gemini = GeminiWeb(session, cfg)
+            login_probe = lambda sess: gemini.login_ready()
+        ok = login_probe(session)
+        if ok:
+            print(f"[login] ✓ {name} 已有登录态（复用之前保存的会话）")
+        else:
+            method = '登录 Google 账号' if kind == 'gemini' else '完成豆包登录（扫码/验证码均可）'
+            print(f"[login] ⏳ {name}: 请在弹出的浏览器窗口中{method}…")
+            ok = session.wait_logged_in(
+                url, cookies,
+                poll_s=float(get(cfg, "login.poll_interval_seconds", 5)),
+                timeout_s=float(get(cfg, "login.timeout_minutes", 30)) * 60,
+                login_probe=login_probe,
+            )
+        if ok and kind == 'doubao':
+            _save_doubao_login(acct)
         result[name] = ok
-        if not ok:
-            print(f"[login] ✗ {name} 等待登录超时")
-
-    # 登录成功后保持窗口打开，直到主线程通知收尾
-    while not stop_event.is_set():
-        stop_event.wait(1)
-    session.stop()
+        print(f"[login] {'✓ 登录成功，状态已保存' if ok else '✗ 等待登录超时'}: {name}")
+        # Keep the window on its owning Playwright thread until main finishes.
+        while not stop_event.is_set() and not session.page.is_closed():
+            session.page.wait_for_timeout(1000)
+    except Exception as e:
+        print(f"[login] ✗ {name} 登录验证失败: {e}")
+        result[name] = False
+    finally:
+        session.stop()
 
 
 def main():
@@ -115,9 +109,8 @@ def main():
         for a in (get(cfg, "accounts.doubao") or []):
             targets.append((a, "doubao"))
     if args.only in ("gemini", "all"):
-        g = get(cfg, "accounts.gemini")
-        if g:
-            targets.append((g, "gemini"))
+        g = {'name':'gemini', 'profile':'profiles/gemini', **(get(cfg, "accounts.gemini") or {})}
+        targets.append((g, "gemini"))
     if args.account:
         targets = [(a, k) for a, k in targets if a["name"] == args.account]
     if not targets:
@@ -134,7 +127,7 @@ def main():
         threads.append(t)
         time.sleep(2)  # 错开启动，避免 Chrome 抢锁
 
-    print("[login] 请在各窗口分别登录对应账号（每个窗口登录一个不同的豆包账号）。")
+    print("[login] 请在各窗口登录对应账号：Gemini 使用 Google 账号，豆包使用各自的独立账号。")
     try:
         while True:
             time.sleep(3)

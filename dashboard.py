@@ -11,15 +11,16 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
-import yaml
 if sys.platform == 'darwin':
     sys.dont_write_bytecode = True
 from doubao_automation.paths import DATA_ROOT, STATE_DIR, ROOT, PROFILES, PRODUCTS_DIR, SOURCES_DIR, VIDEOS_DIR, LOGS_DIR, resolve, use_workspace_temp
 from doubao_automation.state import JsonStore
 from doubao_automation.account_manager import AccountManager
 from doubao_automation.orchestrator import Pipeline
-from doubao_automation.config import DEFAULT_CONFIG_PATH, load_config
+from doubao_automation.config import DEFAULT_CONFIG_PATH, load_config, require_doubao_accounts, save_config
+from doubao_automation.doubao_login import probe_doubao_login, session_pages
 from doubao_automation.feishu_client import FeishuClient
 from doubao_automation.windows_shell import open_video_folder
 from doubao_automation import postprocess
@@ -80,7 +81,7 @@ proc = None
 pending_accounts = {}
 
 # HTML is inserted here by the migration script.
-HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>豆包 Studio</title><style>*{box-sizing:border-box}body{margin:0;background:#f5f5f7;color:#1d1d1f;font:15px -apple-system,BlinkMacSystemFont,"SF Pro Display",system-ui}.shell{max-width:1160px;margin:auto;padding:28px 22px}header{display:flex;align-items:center;gap:24px;margin-bottom:24px}.logo{font-size:24px;font-weight:750}.nav{display:flex;gap:6px;background:#e9e9ed;padding:5px;border-radius:14px}.nav button{background:transparent;color:#515154;padding:9px 16px;border:0;cursor:pointer}.nav button.active{background:white;box-shadow:0 1px 5px #0002}.status{margin-left:auto;background:#e8f8ee;color:#168044;border-radius:99px;padding:8px 13px;font-size:13px}.card{background:#fff;border:1px solid #e8e8ed;border-radius:20px;padding:22px;margin:14px 0;box-shadow:0 3px 12px #00000008}h1{font-size:28px;margin:0 0 6px}h2{font-size:18px;margin:0 0 14px}.muted{color:#777;font-size:13px}.btn{border:0;border-radius:12px;padding:11px 17px;font-weight:650;background:#007aff;color:white;cursor:pointer}.btn.gray{background:#e9e9ed;color:#222}.btn.red{background:#fff0f0;color:#c22}.actions{display:flex;gap:9px;flex-wrap:wrap}.row{padding:16px;border:1px solid #e8e8ed;border-radius:16px;margin:12px 0}.grid{display:grid;grid-template-columns:220px 1fr;gap:12px}input,textarea{font:inherit;padding:11px;border:1px solid #d2d2d7;border-radius:11px;width:100%;background:white}textarea{min-height:110px}.thumbs{display:flex;gap:8px;overflow:auto;margin:8px 0}.thumbs img{width:90px;height:75px;object-fit:cover;border-radius:10px}.log{white-space:pre-wrap;background:#17171a;color:#eee;border-radius:14px;padding:14px;max-height:190px;overflow:auto}@media(max-width:700px){.grid{grid-template-columns:1fr}header{flex-wrap:wrap}}</style></head><body><main class="shell"><header><div class="logo">豆包 Studio</div><nav class="nav"><button id="navstudio" class="active" onclick="tab('studio')">工作台</button><button id="navaccounts" onclick="tab('accounts')">账号库</button><button id="navvideos" onclick="tab('videos')">已下载视频</button></nav><span class="status" id="status">● 连接中</span></header><section id="studio"><h1>视频自动化工作台</h1><p class="muted">飞书同步、Gemini脚本与豆包视频生成</p><article class="card"><h2>运行控制</h2><div class="actions"><button class="btn" onclick="syncFeishu()">同步飞书</button><span id="sync-result" role="status" aria-live="polite"></span><button class="btn gray" onclick="saveRows()">保存修改</button><button class="btn" onclick="run()">开启运行</button><button class="btn red" onclick="stop()">停止</button></div></article><article class="card"><h2>手动添加素材</h2><div class="grid"><label>keyword<input id="newkw"></label><label>提示词<textarea id="newprompt"></textarea></label><label>视频<input id="newvid" type="file" accept="video/*" multiple></label><label>产品图<input id="newimg" type="file" accept="image/*" multiple></label></div><button class="btn" onclick="upload()">添加素材</button></article><article class="card"><h2>同步记录</h2><div id="rows"></div></article></section><section id="accounts" style="display:none"><h1>豆包账号库</h1><article class="card"><div id="accountRows"></div><button class="btn" onclick="addAccount()">＋ 添加豆包账号</button></article></section><section id="videos" style="display:none"><h1>已下载视频</h1><div id="videoRows"></div></section><article class="card"><h2>操作消息</h2><pre class="log" id="log">就绪</pre></article><article class="card"><h2>运行日志</h2><pre class="log" id="runlog">暂无运行日志</pre></article></main><script src="/dashboard.js"></script></body></html>'''
+HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>豆包 Studio</title><style>*{box-sizing:border-box}body{margin:0;background:#f5f5f7;color:#1d1d1f;font:15px -apple-system,BlinkMacSystemFont,"SF Pro Display",system-ui}.shell{max-width:1160px;margin:auto;padding:28px 22px}header{display:flex;align-items:center;gap:24px;margin-bottom:24px}.logo{font-size:24px;font-weight:750}.nav{display:flex;gap:6px;background:#e9e9ed;padding:5px;border-radius:14px}.nav button{background:transparent;color:#515154;padding:9px 16px;border:0;cursor:pointer}.nav button.active{background:white;box-shadow:0 1px 5px #0002}.status{margin-left:auto;background:#e8f8ee;color:#168044;border-radius:99px;padding:8px 13px;font-size:13px}.card{background:#fff;border:1px solid #e8e8ed;border-radius:20px;padding:22px;margin:14px 0;box-shadow:0 3px 12px #00000008}h1{font-size:28px;margin:0 0 6px}h2{font-size:18px;margin:0 0 14px}.muted{color:#777;font-size:13px}.btn{border:0;border-radius:12px;padding:11px 17px;font-weight:650;background:#007aff;color:white;cursor:pointer}.btn.gray{background:#e9e9ed;color:#222}.btn.red{background:#fff0f0;color:#c22}.actions{display:flex;gap:9px;flex-wrap:wrap}.row{padding:16px;border:1px solid #e8e8ed;border-radius:16px;margin:12px 0}.grid{display:grid;grid-template-columns:220px 1fr;gap:12px}input,textarea{font:inherit;padding:11px;border:1px solid #d2d2d7;border-radius:11px;width:100%;background:white}textarea{min-height:110px}.thumbs{display:flex;gap:8px;overflow:auto;margin:8px 0}.thumbs img{width:90px;height:75px;object-fit:cover;border-radius:10px}.log{white-space:pre-wrap;background:#17171a;color:#eee;border-radius:14px;padding:14px;max-height:190px;overflow:auto}@media(max-width:700px){.grid{grid-template-columns:1fr}header{flex-wrap:wrap}}</style></head><body><main class="shell"><header><div class="logo">豆包 Studio</div><nav class="nav"><button id="navstudio" class="active" onclick="tab('studio')">工作台</button><button id="navaccounts" onclick="tab('accounts')">账号库</button><button id="navvideos" onclick="tab('videos')">已下载视频</button></nav><span class="status" id="status">● 连接中</span></header><section id="studio"><h1>视频自动化工作台</h1><p class="muted">飞书同步、Gemini脚本与豆包视频生成</p><article class="card"><h2>运行控制</h2><div class="actions"><button class="btn" onclick="syncFeishu()">同步飞书</button><span id="sync-result" role="status" aria-live="polite"></span><button class="btn gray" onclick="saveRows()">保存修改</button><button class="btn" onclick="run()">开启运行</button><button class="btn red" onclick="stop()">停止</button></div></article><article class="card"><h2>手动添加素材</h2><div class="grid"><label>keyword<input id="newkw"></label><label>提示词<textarea id="newprompt"></textarea></label><label>视频<input id="newvid" type="file" accept="video/*" multiple></label><label>产品图<input id="newimg" type="file" accept="image/*" multiple></label></div><button class="btn" onclick="upload()">添加素材</button></article><article class="card"><h2>提示词与视频记录</h2><div id="rows"></div></article></section><section id="accounts" style="display:none"><h1>豆包账号库</h1><article class="card"><div id="accountRows"></div><button class="btn" onclick="addAccount()">＋ 添加豆包账号</button></article></section><section id="videos" style="display:none"><h1>已下载视频</h1><div id="videoRows"></div></section><article class="card"><h2>操作消息</h2><pre class="log" id="log">就绪</pre></article><article class="card"><h2>运行日志</h2><pre class="log" id="runlog">暂无运行日志</pre></article></main><script src="/dashboard.js"></script></body></html>'''
 
 def store():
     return JsonStore(STATE_DIR / 'pipeline_state.json')
@@ -188,7 +189,23 @@ def history_preview():
 @app.get('/api/state')
 def state():
     d = readonly_snapshot(STATE_DIR / 'pipeline_state.json')
-    pm = {p.get('keyword',''): p for p in d.get('products', [])}
+    hidden_ids=set(d.get('hidden_source_ids',[]))
+    synced_ids=d.get('synced_feishu_source_ids')
+    restorable_hidden=hidden_ids & set(synced_ids) if isinstance(synced_ids,list) else hidden_ids
+    images_by_keyword={}
+    sources=d.get('sources',[])
+    for product in d.get('products',[]):
+        if not product.get('keyword'):
+            continue
+        images=images_by_keyword.setdefault(product.get('keyword',''),[])
+        for image in product.get('images',[]):
+            if image not in images:
+                images.append(image)
+    product_rows=[dict(record_id=p.get('record_id',''),name=p.get('name',''),
+                       keyword=p.get('keyword',''),prompt=p.get('prompt_text',''),
+                       images=list(dict.fromkeys(p.get('images',[]))),
+                       linked_sources=sum(bool(p.get('keyword')) and s.get('keyword','')==p.get('keyword','') for s in sources))
+                  for p in d.get('products',[])]
     log = ''
     log_path = d.get('run_log')
     if log_path:
@@ -204,14 +221,49 @@ def state():
                    running=running(),
                     can_resume=has_unfinished_plan(d),resume_script_count=planned_script_count(d),resume_run_id=d.get('run_id',''),
                    returncode=d.get('run_returncode'), log=log, tasks=d.get('tasks', []),
+                   product_rows=product_rows, sync_summary=d.get('sync_summary'),
+                   hidden_sources=len(restorable_hidden),
+                   unavailable_hidden_sources=len(hidden_ids-restorable_hidden),
                    rows=[{'record_id':s.get('record_id',''), 'keyword':s.get('keyword',''),
                           'prompt':s.get('prompt_text',''), 'videos':s.get('videos',[]),
-                          'images':pm.get(s.get('keyword',''),{}).get('images',[])} for s in d.get('sources',[])])
+                          'images':images_by_keyword.get(s.get('keyword',''),[])} for s in sources])
+
+
+def sync_report(stats,products,sources,visible,restored):
+    """Report remote reads, intentional filtering and visible rows separately."""
+    stats=stats if isinstance(stats,dict) else {}
+    report={}
+    defaults={'products':dict(remote_records=len(products),imported_records=len(products),
+                              skipped_no_images=0,attachments=sum(len(p.get('images',[])) for p in products),
+                              downloaded_attachments=sum(len(p.get('images',[])) for p in products)),
+              'sources':dict(remote_records=len(sources),imported_records=len(sources),skipped_empty=0,
+                             skipped_oversized_only=0,oversized_attachments=0,
+                             attachments=sum(len(s.get('videos',[])) for s in sources),
+                             downloaded_attachments=sum(len(s.get('videos',[])) for s in sources))}
+    for kind,fallback in defaults.items():
+        counts=stats.get(kind) if isinstance(stats.get(kind),dict) else {}
+        report[kind]={key:value if isinstance(value:=counts.get(key),int) and not isinstance(value,bool)
+                           and value>=0 else default for key,default in fallback.items()}
+    report['sources'].update(visible_records=len(visible),hidden_records=len(sources)-len(visible))
+    report['products']['visible_records']=len(products)
+    source_keywords={s.get('keyword') for s in visible if s.get('keyword')}
+    image_keywords={p.get('keyword') for p in products if p.get('keyword') and p.get('images')}
+    report.update(restored_hidden=restored,
+                  unmatched_products=sum(p.get('keyword','') not in source_keywords for p in products),
+                  sources_without_images=sum(s.get('keyword','') not in image_keywords for s in visible))
+    return report
 
 @app.post('/api/sync')
 def sync():
     with lock:
         require_idle()
+        body=request.get_json(silent=True)
+        body={} if body is None else body
+        if not isinstance(body,dict) or not isinstance(body.get('restore_hidden',True),bool):
+            return jsonify(error='restore_hidden 必须为布尔值'),400
+        # Removing a row affects this local view until the next normal sync.
+        restore_hidden=body.get('restore_hidden',True)
+        fc=None
         try:
             try:
                 cfg=load_config()
@@ -221,13 +273,28 @@ def sync():
             fixed=fc.load_fixed_prompt(); ps=fc.fetch_products(); ss=fc.fetch_sources()
             with store().txn() as d:
                 hidden=set(d.get('hidden_source_ids',[]))
+                restored=hidden & {s.get('record_id') for s in ss} if restore_hidden else set()
+                if restored:
+                    d['hidden_source_ids']=[rid for rid in d.get('hidden_source_ids',[]) if rid not in restored]
+                    hidden-=restored
                 local=[s for s in d.get('sources',[]) if s.get('record_id','').startswith('local_')]
                 local_products=[p for p in d.get('products',[]) if p.get('record_id','').startswith('local_')]
                 visible=[s for s in ss if s.get('record_id') not in hidden]
-                d.update(products=ps+local_products, sources=visible+local, fixed_prompt=fixed, scripts=[], tasks=[])
-            return jsonify(ok=True, products=len(ps), sources=len(visible), local_sources=len(local))
+                remote_ids={s.get('record_id') for s in ss}
+                summary=sync_report(getattr(fc,'sync_stats',None),ps,ss,visible,len(restored))
+                summary['unavailable_hidden_records']=len(hidden-remote_ids)
+                d.update(products=ps+local_products, sources=visible+local, fixed_prompt=fixed,
+                         scripts=[], tasks=[],sync_summary=summary,
+                         synced_feishu_source_ids=sorted(rid for rid in remote_ids if rid))
+            return jsonify(ok=True, products=len(ps), sources=len(visible), local_sources=len(local),
+                           hidden_sources=len(hidden & remote_ids),
+                           unavailable_hidden_sources=len(hidden-remote_ids),
+                           restored_hidden=len(restored),summary=summary)
         except Exception as e:
             return jsonify(error=str(e)), 500
+        finally:
+            if fc is not None:
+                fc.close()
 
 @app.post('/api/edit')
 def edit():
@@ -308,6 +375,7 @@ def run():
             return jsonify(error='流水线已在运行'),409
         if any(job['thread'].is_alive() for job in pending_accounts.values()):
             raise ValueError('账号登录窗口仍在使用，请完成登录或关闭登录窗口后再运行')
+        require_doubao_accounts(load_config())
         runner=Pipeline.__new__(Pipeline); runner.store=store()
         try:
             with runner._run_lock():
@@ -369,8 +437,7 @@ def stop():
     return jsonify(ok=True,stopped=True)
 
 def _savecfg(cfg):
-    p=DEFAULT_CONFIG_PATH; p.parent.mkdir(parents=True,exist_ok=True); tmp=p.with_suffix('.yaml.tmp')
-    tmp.write_text(yaml.safe_dump(cfg,allow_unicode=True,sort_keys=False),encoding='utf-8'); os.replace(tmp,p)
+    save_config(cfg,DEFAULT_CONFIG_PATH)
 
 def account_manager(names=()):
     state=JsonStore(STATE_DIR/'accounts.json')
@@ -406,6 +473,9 @@ def account_list():
         for a in items:
             name=a['name']; state=manager.status(name); job=pending_accounts.get(name,{})
             opened=bool(job.get('thread') and job['thread'].is_alive())
+            if opened and state.get('status') in ('error','needs_login'):
+                state=dict(state,status='opening' if job.get('status')=='opening' else 'needs_login',
+                           note=job.get('note','正在打开登录窗口'))
             out.append(dict(name=name,profile=a['profile'],enabled=a.get('enabled',True),saved=True,
                             status=state.get('status','needs_login'),note=state.get('note','尚未验证登录'),
                             quota=account_quota(manager,name,state),login_window_open=opened,
@@ -417,26 +487,29 @@ def login_worker(name,profile,job):
     from doubao_automation.browser_pool import BrowserSession
     sess=None
     try:
-        use_workspace_temp(); cfg=load_config()
+        use_workspace_temp(); cfg=copy.deepcopy(load_config())
+        # Login always needs a visible window, even when generation is headless.
+        cfg['browser']=dict(cfg.get('browser') or {},headless=False)
         sess=BrowserSession(name,profile,cfg,start_url='https://www.doubao.com/chat/').start()
         job.update(status='needs_login',note='请在独立浏览器内手动登录；检测成功后自动保存并关闭窗口')
         job['ready'].set()
         deadline=time.monotonic()+7200
-        expected=set(cfg.get('login',{}).get('doubao_logged_in_cookies',[]))-{'uid_tt'}
-        if not expected:
-            job.update(status='needs_login',note='登录检测规则未配置；请手动登录，并在本机配置检测规则后重新检查')
         while time.monotonic()<deadline and not job['stop'].is_set():
-            if sess.page.is_closed():
+            pages=session_pages(sess)
+            if not pages:
                 break
-            expected=set(cfg.get('login',{}).get('doubao_logged_in_cookies',[]))-{'uid_tt'}
-            valid=sess.has_any_cookie('https://www.doubao.com',expected)
-            valid=valid and sess.page.locator('div[contenteditable="true"]').count()>0
-            if valid:
+            if sess.page.is_closed():
+                sess.page=pages[0]
+            result=probe_doubao_login(sess,cfg)
+            job.update(note=result['note'])
+            if result['logged_in']:
                 with lock:
                     current=load_config()
-                    for a in current['accounts']['doubao']:
-                        if a['name']==name:
-                            a['enabled']=True
+                    acct=next((a for a in current.get('accounts',{}).get('doubao',[])
+                               if a['name']==name and a['profile']==profile),None)
+                    if acct is None:
+                        raise ValueError('账号配置已改变，请重新打开登录窗口')
+                    acct['enabled']=True
                     _savecfg(current)
                 account_status(name,'available','登录已验证，浏览器配置已保存')
                 job.update(verified=True,status='verified',note='登录已验证，浏览器配置已保存')
@@ -446,7 +519,15 @@ def login_worker(name,profile,job):
         if not job.get('verified'):
             account_status(name,'needs_login','登录尚未完成，可重新打开登录窗口')
     except Exception as e:
-        account_status(name,'error',str(e)[:600]); job.update(error=str(e),status='error',note=str(e)[:600])
+        message=f'{e}；启动日志：{LOGS_DIR / "login_browser.log"}'
+        job.update(error=message,status='error',note=message[:1000])
+        try:
+            LOGS_DIR.mkdir(parents=True,exist_ok=True)
+            with (LOGS_DIR/'login_browser.log').open('a',encoding='utf-8') as handle:
+                handle.write(time.strftime('%Y-%m-%d %H:%M:%S')+f' [{name}]\n'+traceback.format_exc()+'\n')
+        except OSError:
+            pass
+        account_status(name,'error',message[:1000])
     finally:
         if sess:
             sess.stop()
@@ -462,6 +543,25 @@ def start_login(name,profile):
     pending_accounts[name]=job; job['thread'].start()
     return job
 
+
+def login_start_response(name,profile,job):
+    # Wait outside the dashboard lock: the worker needs that lock to save login.
+    ready=job['ready'].wait(8)
+    if job.get('error'):
+        return jsonify(error=job['error'],code='browser_start_failed',name=name,
+                       profile=profile,saved=True,status='error'),503
+    if job.get('verified'):
+        return jsonify(ok=True,name=name,profile=profile,saved=True,status='verified',
+                       message='登录已验证，账号浏览器配置已保存')
+    if ready and not job['finished'].is_set():
+        return jsonify(ok=True,name=name,profile=profile,saved=True,status='needs_login',
+                       message='登录窗口已打开，请在独立浏览器中手动登录')
+    if ready:
+        return jsonify(error='登录窗口已关闭，请重新打开',name=name,profile=profile,
+                       saved=True,status='needs_login'),409
+    return jsonify(ok=True,name=name,profile=profile,saved=True,status='opening',
+                   message='账号配置已保存，浏览器正在启动；请稍候，启动结果会显示在账号卡片'),202
+
 @app.post('/api/accounts/add')
 def account_add():
     with lock:
@@ -470,8 +570,8 @@ def account_add():
             i+=1
         name=f'doubao{i}'; profile=f'profiles/{name}'
         items.append({'name':name,'profile':profile,'enabled':False}); _savecfg(cfg)
-        start_login(name,profile)
-    return jsonify(ok=True,name=name,profile=profile,saved=True,status='opening')
+        job=start_login(name,profile)
+    return login_start_response(name,profile,job)
 
 @app.post('/api/accounts/open')
 def account_open():
@@ -479,22 +579,29 @@ def account_open():
     with lock:
         require_idle(); a=next((a for a in load_config()['accounts']['doubao'] if a['name']==name),None)
         if not a: abort(404)
-        start_login(name,a['profile'])
-    return jsonify(ok=True,name=name,status='opening')
+        job=start_login(name,a['profile'])
+    return login_start_response(name,a['profile'],job)
 
 @app.post('/api/accounts/confirm')
 def confirm():
     name=request.get_json(force=True).get('name')
     manager=account_manager()
-    if not manager.store.snapshot().get('accounts',{}).get(name):
-        return jsonify(error='尚未检测到登录，请打开登录窗口并手动登录'),400
     status=manager.status(name); quota=account_quota(manager,name,status)
     if status.get('status') in ('available','busy','exhausted'):
         label={'available':'已登录','busy':'账号正在运行','exhausted':'今日额度耗尽'}[status['status']]
         message=label+'，今日剩余 '+str(quota['remaining'])+'/'+str(quota['limit'])
         if not quota['remaining']: message+='，后续任务自动跳过'
         return jsonify(ok=True,saved=True,name=name,status=status['status'],quota=quota,message=message)
-    return jsonify(error=status.get('note') or '尚未检测到登录，请打开登录窗口并手动登录'),400
+    if status.get('status')=='disabled':
+        return jsonify(error=status.get('note') or '账号已禁用，请先检查禁用原因'),400
+    with lock:
+        require_idle()
+        acct=next((a for a in load_config().get('accounts',{}).get('doubao',[]) if a['name']==name),None)
+        if not acct:
+            return jsonify(error='账号不存在，请先在账号库添加账号'),400
+        # Reuse the owning worker; never call its Playwright objects from Flask.
+        job=start_login(name,acct['profile'])
+    return login_start_response(name,acct['profile'],job)
 
 @app.post('/api/accounts/close')
 def account_close():
@@ -547,10 +654,35 @@ def upload():
 def videos():
     out=[]
     processed=readonly_postprocess_snapshots()
+    snap=readonly_snapshot(STATE_DIR/'pipeline_state.json')
+    scripts={script['id']:(index,script) for index,script in enumerate(snap.get('scripts',[]),1) if script.get('id')}
+    labels={}
+    for task in snap.get('tasks',[]):
+        order,script=scripts.get(task.get('script_id'),(None,{}))
+        if order is None:
+            continue
+        segment=int(task.get('seg_index',0))+1
+        total=int(task.get('seg_total',1))
+        keyword=str(script.get('keyword') or task.get('keyword') or '').strip()
+        label=(keyword+' · ' if keyword else '')+f'脚本{order} · 片段{segment}/{total}'
+        for field in ('video','raw_video'):
+            if task.get(field):
+                labels[str(Path(task[field]).resolve())]=label
+        # The raw download can become visible before its journal update.
+        stem=f"{task['script_id']}_seg{segment-1}"
+        for suffix in ('.mp4','.raw.mp4'):
+            labels[str((VIDEOS_DIR/(stem+suffix)).resolve())]=label
     for p in VIDEOS_DIR.glob('*.mp4'):
         try:s=p.stat()
         except FileNotFoundError:continue  # A concurrent delete may remove an enumerated file.
-        out.append({'name':p.name,'path':str(p.resolve()),'size':f'{s.st_size/1048576:.1f}MB','modified':datetime.datetime.fromtimestamp(s.st_mtime).isoformat(timespec='seconds'),'postprocess':processed.get(str(p.resolve()))})
+        raw=p.name.endswith('.raw.mp4')
+        if raw and p.with_name(p.name.removesuffix('.raw.mp4')+'.mp4').is_file():
+            continue  # Keep the raw file on disk; show the finished clip once.
+        path=str(p.resolve())
+        label=labels.get(path,p.name)
+        if raw and path in labels:
+            label+='（原始下载）'
+        out.append({'name':p.name,'label':label,'path':path,'size':f'{s.st_size/1048576:.1f}MB','modified':datetime.datetime.fromtimestamp(s.st_mtime).isoformat(timespec='seconds'),'postprocess':processed.get(path)})
     return jsonify(videos=sorted(out,key=lambda x:x['modified'],reverse=True))
 
 @app.post('/api/videos/approve')
@@ -596,6 +728,23 @@ def openvideo():
         return jsonify(error=f'无法打开文件夹：{exc}',folder=str(p.parent)),500
     message='已请求 Finder 显示视频，请确认窗口' if sys.platform=='darwin' else '已打开视频所在文件夹'
     return jsonify(ok=True,message=message,folder=str(p.parent))
+
+@app.get('/media-file')
+def media_file():
+    # Full paths distinguish same-named attachments, but access stays limited
+    # to imported Feishu media. Resolve symlinks before checking containment.
+    value=request.args.get('path','')
+    if not value or len(value)>4096:
+        abort(404)
+    try:
+        candidate=Path(value)
+        path=(candidate if candidate.is_absolute() else DATA_ROOT/candidate).resolve()
+        allowed=any(base.resolve() in path.parents for base in (PRODUCTS_DIR,SOURCES_DIR))
+        if not allowed or not path.is_file():
+            abort(404)
+    except (OSError,ValueError,RuntimeError):
+        abort(404)
+    return send_file(path,conditional=True)
 
 @app.get('/media/<path:name>')
 def media(name):

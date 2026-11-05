@@ -11,6 +11,7 @@
 import re
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .config import get
 from .doubao_batch import BatchGenerationMixin, quota_exhaustion_matches
@@ -126,16 +127,51 @@ class DoubaoAgent(BatchGenerationMixin):
     def open_chat(self):
         page = self.page
         page.goto(self.chat_url, wait_until="domcontentloaded")
-        page.wait_for_timeout(3000)
         self._handle_dialogs()
         self._assert_logged_in()
-        box = _combine(self.sel.get("input_box"))
-        if box:
+        self._wait_chat_ready(fresh=False)
+
+    def _chat_ready(self, fresh=False):
+        """A root URL alone can precede hydration of the previous conversation."""
+        url = urlsplit(self.page.url)
+        if url.scheme != 'https' or url.hostname not in ('www.doubao.com', 'doubao.com'):
+            return False
+        if fresh and url.path.rstrip('/') != '/chat':
+            return False
+        boxes = self.page.locator(_combine(self.sel.get('input_box')) or
+                                  '[contenteditable="true"], textarea, [role="textbox"]')
+        if not any(boxes.nth(i).is_visible() and boxes.nth(i).is_enabled()
+                   for i in range(boxes.count())):
+            return False
+        if fresh:
+            history = self.page.locator(
+                '[data-testid="receive_message"], [data-testid="send_message"], '
+                '[data-message-role="user"], [data-message-role="assistant"], '
+                '[data-role="user"], [data-role="assistant"], '
+                '[class*="block-video-"], [class*="fulfill-video-error-box-"]')
+            if history.count():
+                return False
+        return True
+
+    def _wait_chat_ready(self, fresh=False, deadline=None):
+        deadline = deadline if deadline is not None else time.monotonic() + 20
+        ready_since = None
+        while time.monotonic() < deadline:
+            self._assert_logged_in()
             try:
-                page.locator(box).first.wait_for(state="visible", timeout=20000)
+                ready = self._chat_ready(fresh=fresh)
             except Exception:
-                self._assert_logged_in()
-                raise GenerationFailed(f"[{self.name}] 找不到对话输入框，请运行 inspect-doubao 校准 input_box 选择器")
+                ready = False  # SPA navigation may replace the document during a poll.
+            if ready:
+                ready_since = time.monotonic() if ready_since is None else ready_since
+                if not fresh or time.monotonic() - ready_since >= 1:
+                    return
+            else:
+                ready_since = None
+            self.page.wait_for_timeout(100)
+        detail = ('未能确认新对话为空且已就绪，已在上传和发送前停止，避免误领旧视频'
+                  if fresh else '找不到可用对话输入框，请运行 inspect-doubao 校准 input_box 选择器')
+        raise GenerationFailed(f'[{self.name}] {detail}')
 
     def _assert_logged_in(self):
         url = (self.page.url or "").lower()
@@ -155,18 +191,34 @@ class DoubaoAgent(BatchGenerationMixin):
 
     # ---- 新对话 ----
     def new_chat(self):
+        """Click the real new-chat control and prove an empty hydrated composer.
+
+        Navigating to /chat/ can restore the previous conversation asynchronously;
+        it is only a way to locate the control, never evidence of a new chat.
+        """
         page = self.page
-        for sel in (self.sel.get("new_chat") or []):
-            try:
-                loc = page.locator(sel).first
-                if loc.count() > 0 and loc.is_visible():
-                    loc.click(timeout=4000)
-                    page.wait_for_timeout(1500)
+        configured = self.sel.get('new_chat') or []
+        configured = [configured] if isinstance(configured, str) else configured
+        deadline = time.monotonic() + float(self.dcfg.get('new_chat_timeout_seconds', 30))
+        navigated = False
+        while time.monotonic() < deadline:
+            self._assert_logged_in()
+            candidates = [page.locator(selector) for selector in configured]
+            candidates.append(page.get_by_role(
+                'button', name=re.compile(r'^(?:新对话|New chat)(?:$|[\s⇧⌘+])', re.I)))
+            for matches in candidates:
+                for i in range(matches.count()):
+                    button = matches.nth(i)
+                    if not button.is_visible() or not button.is_enabled():
+                        continue
+                    button.click(timeout=4000)
+                    self._wait_chat_ready(fresh=True, deadline=deadline)
                     return
-            except Exception:
-                continue
-        page.goto(self.chat_url, wait_until="domcontentloaded")
-        page.wait_for_timeout(2000)
+            if not navigated:
+                page.goto(self.chat_url, wait_until='domcontentloaded')
+                navigated = True
+            page.wait_for_timeout(250)
+        raise GenerationFailed(f'[{self.name}] 找不到可用的新对话按钮，已在上传和发送前停止；仅访问 /chat/ 不代表创建成功')
 
     # ---- 上传图片 ----
     def upload_images(self, image_paths: list):
@@ -471,6 +523,9 @@ class DoubaoAgent(BatchGenerationMixin):
     }"""
 
     def inspect_dump(self, out_dir):
+        import json
+        import os
+
         page = self.page
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -484,6 +539,24 @@ class DoubaoAgent(BatchGenerationMixin):
         if messages.count():
             (out_dir/f'{self.name}_received_dom.html').write_text(messages.last.evaluate('(e)=>e.outerHTML'),encoding='utf-8')
             (out_dir/f'{self.name}_received_text.txt').write_text(messages.last.inner_text(),encoding='utf-8')
+        user_messages = page.evaluate('''() => [...document.querySelectorAll(
+          '[data-testid="send_message"], [data-testid="user_message"], [data-message-role="user"], [data-role="user"]'
+        )].map(node => ({
+          data_testid: node.getAttribute('data-testid'),
+          data_message_role: node.getAttribute('data-message-role'),
+          id: node.id,
+          closest_message_id: node.closest('[data-message-id]')?.getAttribute('data-message-id') || '',
+          innerText: node.innerText,
+          textContent: node.textContent,
+          message_text_contents: [...node.querySelectorAll('[data-testid="message_text_content"]')]
+            .map(child => ({innerText: child.innerText, textContent: child.textContent}))
+        }))''')
+        user_path = out_dir / f'{self.name}_user_messages.json'
+        fd = os.open(user_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump(user_messages, handle, ensure_ascii=False, indent=2)
+        print(f'[{self.name}] 用户消息诊断已保存: {user_path}（{len(user_messages)} 条）')
         lines = [f"URL: {page.url}"]
         for idx, frame in enumerate(page.frames):
             try:

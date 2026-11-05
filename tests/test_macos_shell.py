@@ -1,9 +1,14 @@
 """Platform checks use mocks and never launch Finder or modify user files."""
+import os
+import stat
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from doubao_automation import windows_shell
@@ -42,15 +47,22 @@ class MacOSFolderTests(unittest.TestCase):
 class DashboardPlatformTests(unittest.TestCase):
     def test_save_config_uses_configured_data_location(self):
         import dashboard
-        destination = Path('Z:/example/config/config.yaml')
-        with patch.object(dashboard, 'DEFAULT_CONFIG_PATH', destination), \
-             patch.object(Path, 'mkdir') as mkdir, \
-             patch.object(Path, 'write_text') as write, \
-             patch.object(dashboard.os, 'replace') as replace:
-            dashboard._savecfg({'accounts': {}})
-        self.assertTrue(mkdir.called)
-        self.assertTrue(write.called)
-        self.assertEqual(replace.call_args.args[1], destination)
+        from doubao_automation import config
+        settings = {'accounts': {}}
+        with tempfile.TemporaryDirectory(prefix='configured-data-') as directory:
+            root = Path(directory)
+            source = root / 'checkout'
+            source.mkdir()
+            destination = root / 'private data/config/config.yaml'
+            with patch.object(dashboard, 'DEFAULT_CONFIG_PATH', destination), \
+                 patch.object(dashboard, 'ROOT', source), \
+                 patch.object(config, 'ROOT', source):
+                dashboard._savecfg(settings)
+            self.assertEqual(yaml.safe_load(destination.read_text()), settings)
+            self.assertFalse((source / 'config/config.yaml').exists())
+            self.assertEqual(list(destination.parent.glob('.config-*.yaml.tmp')), [])
+            if os.name != 'nt':
+                self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
 
     def test_finder_ui_reports_request_not_window_confirmation(self):
         import dashboard
@@ -64,19 +76,39 @@ class DashboardPlatformTests(unittest.TestCase):
         self.assertIn('请求', result.json['message'])
         self.assertIn('确认', result.json['message'])
 
-    def test_missing_cookie_detection_rules_never_reports_verified(self):
+    def test_builtin_login_probe_rejects_missing_session_with_empty_rules(self):
         import threading
         import dashboard
-        stop = threading.Event(); stop.set()
+        stop = threading.Event()
         job = {'stop': stop, 'ready': threading.Event(), 'finished': threading.Event()}
+        page = Mock()
+        page.url = 'https://www.doubao.com/chat/'
+        page.is_closed.return_value = False
+        empty = Mock()
+        empty.count.return_value = 0
+        page.get_by_role.return_value = empty
+        page.locator.return_value = empty
+        page.wait_for_timeout.side_effect = lambda _: stop.set()
+        session = SimpleNamespace(context=SimpleNamespace(pages=[page]), page=page,
+                                  cookies=Mock(return_value=[]), stop=Mock())
         with patch.object(dashboard, 'load_config', return_value={'login': {}}), \
              patch.object(dashboard, 'use_workspace_temp'), \
-             patch.object(dashboard, 'account_status'), \
+             patch.object(dashboard, 'account_status') as account_status, \
+             patch.object(dashboard, '_savecfg') as save_config, \
+             patch.object(dashboard, 'probe_doubao_login',
+                          wraps=dashboard.probe_doubao_login) as login_probe, \
              patch('doubao_automation.browser_pool.BrowserSession') as browser:
+            browser.return_value.start.return_value = session
             dashboard.login_worker('account', 'profiles/account', job)
+        login_probe.assert_called_once()
+        self.assertIs(login_probe.call_args.args[0], session)
+        self.assertEqual(login_probe.call_args.args[1]['login'], {})
         self.assertFalse(job.get('verified', False))
-        self.assertIn('登录检测规则未配置', job['note'])
-        browser.return_value.start.return_value.stop.assert_called_once()
+        self.assertEqual(job['status'], 'needs_login')
+        save_config.assert_not_called()
+        self.assertTrue(all(call.args[1] != 'available' for call in account_status.call_args_list))
+        session.cookies.assert_called_once_with(page.url)
+        session.stop.assert_called_once()
 
 if __name__ == '__main__':
     unittest.main()

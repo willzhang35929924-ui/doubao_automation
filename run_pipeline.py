@@ -216,13 +216,17 @@ def main():
     sp.set_defaults(func=cmd_concat)
 
     args = ap.parse_args()
-    cfg = load_config()
-    ensure_dirs()
-    use_workspace_temp()
-    if args.cmd in ("all", "fetch", "scripts", "plan", "run", "status"):
-        args.stage = args.cmd
-        return cmd_pipeline(args, cfg) or 0
-    return args.func(args, cfg) or 0
+    try:
+        cfg = load_config()
+        ensure_dirs()
+        use_workspace_temp()
+        if args.cmd in ("all", "fetch", "scripts", "plan", "run", "status"):
+            args.stage = args.cmd
+            return cmd_pipeline(args, cfg) or 0
+        return args.func(args, cfg) or 0
+    except ValueError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

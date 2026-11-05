@@ -1,5 +1,6 @@
 let data, accounts = [], dirty = false;
 const accountPending = new Map(), accountFeedback = new Map();
+const openingLoginAccounts = new Set();
 let accountFetchSequence = 0, accountMarkup = '', accountAddPending = false;
 const videoFolderFeedback = new Map(), videoApprovalErrors = new Map(), videoApprovalPending = new Set(), videoApprovalJobs = new Map();
 const videoDeleteFeedback = new Map(), videoDeletePending = new Set();
@@ -32,9 +33,12 @@ async function api(path, body) {
       headers['X-CSRF-Token'] = csrfToken;
       if (!formData) headers['Content-Type'] = 'application/json';
     }
+    // Safari sends Origin: null for same-origin POSTs under the document's
+    // no-referrer policy. Keep origin information on these local API requests;
+    // same-origin still suppresses Referer on any cross-origin redirect.
     return fetch(path, {method: writing ? 'POST' : 'GET',
       body: formData ? body : writing ? JSON.stringify(body) : undefined,
-      headers, mode:'same-origin', credentials:'same-origin'});
+      headers, mode:'same-origin', credentials:'same-origin', referrerPolicy:'same-origin'});
   };
   const parse = async response => {
     try { return await response.json(); }
@@ -46,7 +50,7 @@ async function api(path, body) {
     // response is safe to retry after a service restart; other errors never retry.
     let next;
     try {
-      const fresh = await fetch('/api/csrf', {method:'GET', cache:'no-store', mode:'same-origin', credentials:'same-origin'});
+      const fresh = await fetch('/api/csrf', {method:'GET', cache:'no-store', mode:'same-origin', credentials:'same-origin', referrerPolicy:'same-origin'});
       const payload = await parse(fresh);
       if (!fresh.ok || typeof payload.token !== 'string' || !payload.token) throw Error('invalid token');
       next = payload.token;
@@ -74,6 +78,7 @@ async function tab(t) {
   try { if (t === 'accounts') await loadAccounts(); if (t === 'videos') await loadVideos(); }
   catch(e) { msg(e.message); }
 }
+function mediaUrl(path) { return '/media-file?path='+encodeURIComponent(path); }
 async function refresh() {
   try {
     const next = await api('/api/state');
@@ -82,7 +87,7 @@ async function refresh() {
     document.querySelector('#runlog').textContent = next.log || '暂无运行日志';
     if (dirty || document.activeElement?.closest('#rows')) return;
     data = next;
-    document.querySelector('#rows').innerHTML = data.rows.map((x,i) => `<article class="row"><button class="btn red" data-record-id="${esc(x.record_id)}" onclick="deleteRow(this)">删除此记录</button><div class="grid"><label>keyword<input data-i="${i}" data-k="kw" value="${esc(x.keyword)}"></label><label>提示词<textarea data-i="${i}" data-k="prompt">${esc(x.prompt)}</textarea></label><div>视频 ${x.videos.length} 个</div><div>图片 ${x.images.length} 张<div class="thumbs">${x.images.map(im => `<img src="/media/${encodeURIComponent(im.split(/[\\/]/).pop())}">`).join('')}</div></div></div></article>`).join('') || '暂无同步记录';
+    document.querySelector('#rows').innerHTML = data.rows.map((x,i) => `<article class="row"><button class="btn red" data-record-id="${esc(x.record_id)}" onclick="deleteRow(this)">删除此记录</button><div class="grid"><label>keyword<input data-i="${i}" data-k="kw" value="${esc(x.keyword)}"></label><label>提示词<textarea data-i="${i}" data-k="prompt">${esc(x.prompt)}</textarea></label><div>视频 ${x.videos.length} 个</div><div>图片 ${x.images.length} 张<div class="thumbs">${x.images.map(im => `<img src="${mediaUrl(im)}">`).join('')}</div></div></div></article>`).join('') || '暂无素材记录';
   } catch(e) { refreshFailed('工作台',e); }
 }
 async function saveRows(show = true) {
@@ -140,7 +145,7 @@ async function previewClearHistory() {
     msg('历史清理仅提供预览，未删除记录或文件。\n' + JSON.stringify(result, null, 2));
   } catch (e) { msg('历史清理预览失败：' + e.message); }
 }
-async function deleteRow(target) { const id = typeof target === 'string' ? target : target.dataset.recordId; if (!confirm('从本地面板移除此记录？飞书原表不变')) return; try { msg(await api('/api/rows/delete',{record_id:id})); dirty=false; await refresh(); } catch(e) { msg(e.message); } }
+async function deleteRow(target) { const id = typeof target === 'string' ? target : target.dataset.recordId; if (!confirm('从当前工作台移除此记录？飞书记录会在下次同步时恢复。')) return; try { msg(await api('/api/rows/delete',{record_id:id})); dirty=false; await refresh(); } catch(e) { msg(e.message); } }
 const accountLabels = {available:'已登录，可运行', busy:'运行中', checking:'正在验证登录', needs_login:'待登录', exhausted:'今日额度耗尽', disabled:'不可用', opening:'正在打开浏览器', error:'浏览器启动失败'};
 async function loadAccounts() {
   const sequence = ++accountFetchSequence;
@@ -148,6 +153,16 @@ async function loadAccounts() {
   if (sequence !== accountFetchSequence) return;
   refreshRecovered('账号');
   accounts = result.accounts || [];
+  for (const a of accounts) {
+    if (!openingLoginAccounts.has(a.name)) continue;
+    let message;
+    if (!a.login_window_open && a.status === 'error') message = '登录窗口启动失败：'+(a.note || '请重试并查看启动日志');
+    else if (a.login_window_open && a.login_status !== 'opening') message = a.name+' 登录窗口已打开，请手动登录';
+    else if (!a.login_window_open && a.status === 'available') message = a.name+' 登录已验证，账号配置已保存';
+    if (message) {
+      openingLoginAccounts.delete(a.name); accountFeedback.set(a.name,message); msg(message);
+    }
+  }
   renderAccounts();
 }
 function accountQuota(a) {
@@ -176,9 +191,14 @@ async function addAccount() {
   if (button) button.disabled = true;
   try {
     const result = await api('/api/accounts/add',{});
-    msg(result.name+' 配置已保存，正在打开独立浏览器。请手动登录，验证成功后会自动保存。');
+    if (result.status === 'opening') openingLoginAccounts.add(result.name);
+    msg(result.message || result.name+' 配置已保存，浏览器正在启动，请稍候查看账号状态。');
     await loadAccounts();
-  } catch(e) { msg(e.message); }
+  } catch(e) {
+    msg('登录窗口未能打开：'+e.message);
+    // A failed browser launch still preserves the new account/Profile for retry.
+    try { await loadAccounts(); } catch(refreshError) { refreshFailed('账号',refreshError); }
+  }
   finally { accountAddPending = false; if (button) button.disabled = false; }
 }
 function accountName(target) { return typeof target === 'string' ? target : target.dataset.name; }
@@ -188,6 +208,7 @@ async function accountAction(target, action, pendingText) {
   accountPending.set(name,pendingText); accountFeedback.delete(name); ++accountFetchSequence; renderAccounts();
   try {
     const result = await api('/api/accounts/'+action,{name});
+    if (action === 'open' && result.status === 'opening') openingLoginAccounts.add(name);
     const message = result.message || (action === 'open' ? '登录窗口已打开，请完成登录并等待自动验证' : action === 'close' ? '登录窗口已关闭' : action === 'delete' ? '账号配置已删除' : '账号状态已检查');
     accountFeedback.set(name,message); msg(message);
     if (action === 'delete') { accounts = accounts.filter(a => a.name !== name); accountFeedback.delete(name); }
@@ -232,7 +253,7 @@ function renderVideos() {
     const output = complete && job.output_path ? `<a class="btn" target="_blank" rel="noopener" href="/media-video?path=${encodeURIComponent(job.output_path)}">查看1080P成片</a>` : '';
     const failureLog = job?.status === 'failed' && job.log_tail ? `<details><summary>查看处理日志</summary><pre class="log">${esc(job.log_tail)}</pre></details>` : '';
     const deletion = `<button class="btn red" data-path="${esc(v.path)}" onclick="deleteVideo(this)" title="${active ? '处理中，暂不能删除' : '永久删除该视频文件'}"${active || deleting ? ' disabled' : ''}>${deleting ? '正在删除…' : '删除'}</button>${active ? '<span class="muted">处理中，暂不能删除</span>' : ''}`;
-    return `<article class="row"><b>${esc(v.name)}</b> ${esc(v.size)}<div class="actions"><a class="btn" target="_blank" rel="noopener" href="/media-video?path=${encodeURIComponent(v.path)}">打开文件</a><button class="btn gray" data-path="${esc(v.path)}" onclick="openFolder(this)"${folder.pending || deleting ? ' disabled' : ''}>打开文件夹</button><button class="btn" data-path="${esc(v.path)}" onclick="approveVideo(this)"${active || complete || deleting ? ' disabled' : ''}>${label}</button>${output}${deletion}</div><p class="muted folder-result" role="status">${esc(folder.text || '')}</p><p class="muted approval-result" role="status">${esc(status)}</p><p class="muted delete-result" role="status">${esc(videoDeleteFeedback.get(v.path) || '')}</p>${failureLog}</article>`;
+    return `<article class="row"><b title="${esc(v.name)}">${esc(v.label || v.name)}</b> ${esc(v.size)}<div class="actions"><a class="btn" target="_blank" rel="noopener" href="/media-video?path=${encodeURIComponent(v.path)}">打开文件</a><button class="btn gray" data-path="${esc(v.path)}" onclick="openFolder(this)"${folder.pending || deleting ? ' disabled' : ''}>打开文件夹</button><button class="btn" data-path="${esc(v.path)}" onclick="approveVideo(this)"${active || complete || deleting ? ' disabled' : ''}>${label}</button>${output}${deletion}</div><p class="muted folder-result" role="status">${esc(folder.text || '')}</p><p class="muted approval-result" role="status">${esc(status)}</p><p class="muted delete-result" role="status">${esc(videoDeleteFeedback.get(v.path) || '')}</p>${failureLog}</article>`;
   }).join('') || '暂无视频';
   if (markup !== videoMarkup) {
     document.querySelector('#videoRows').innerHTML = markup;

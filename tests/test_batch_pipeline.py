@@ -725,10 +725,26 @@ class BatchPipelineTests(unittest.TestCase):
         self.assertTrue((self.h.frames / 'script50_seg1_end.png').is_file())
 
     def test_tail_failure_recovery_only_retries_local_media_work(self):
+        from doubao_automation.doubao_batch import BatchGenerationMixin
+        original_run_batch = FakeAgent.run_batch
+
+        def bound_raw_fixture(agent, *args, **kwargs):
+            result = original_run_batch(agent, *args, **kwargs)
+            for task_id, filename in result['videos'].items():
+                ref = dict(result['remote_refs'][task_id], ownership_verified=True, kind='card',
+                           card_message_id='message-' + task_id, card_ordinal=0,
+                           owner_user_message_id='request-user-message')
+                raw = Path(filename)
+                raw.write_bytes(raw.read_bytes() * 128)
+                BatchGenerationMixin()._bind_download(raw, ref)
+                result['remote_refs'][task_id] = ref
+            return result
+
         self.plan([('script30', [15, 15])])
         self.h.fail_extract = True
-        with self.assertRaises(RuntimeError):
-            self.pipeline.stage_run()
+        with patch.object(FakeAgent, 'run_batch', bound_raw_fixture):
+            with self.assertRaises(RuntimeError):
+                self.pipeline.stage_run()
         self.assertEqual(self.pipeline.accounts.quota('a')['used'], 2)
         current = self.pipeline.store.snapshot()['tasks']
         self.assertEqual(current[0]['status'], 'local_failed')

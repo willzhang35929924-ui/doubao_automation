@@ -22,6 +22,9 @@ feishu:
     keyword_field: "keyword"
     prompt_field: "提示词"
     video_field: "视频"
+# Empty login settings use built-in Doubao session-cookie + visible chat UI checks.
+# Visitor cookies such as uid_tt never count as proof of login.
+# Visible Gemini windows wait for manual Google login (login.timeout_minutes, default 30).
 login: {}
 doubao:
   # Built-in conservative daily video quota patterns are used when this key is absent.

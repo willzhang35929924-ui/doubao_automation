@@ -1,0 +1,86 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    name: Regression (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      CI: "true"
+      PYTHONDONTWRITEBYTECODE: "1"
+      DOUBAO_DATA_DIR: ${{ runner.temp }}/doubao-ci/data
+      DOUBAO_CONFIG_PATH: ${{ runner.temp }}/doubao-ci/config/config.yaml
+    steps:
+      # Fixed official release commits; update with review rather than mutable tags.
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Install FFmpeg on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ffmpeg
+      - name: Install FFmpeg on macOS
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
+      - name: Install Python dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -r requirements.txt
+      - name: Install managed Chromium and Linux runtime libraries
+        if: runner.os == 'Linux'
+        run: .venv/bin/python -m playwright install --with-deps chromium
+      - name: Install managed Chromium on macOS
+        if: runner.os == 'macOS'
+        run: .venv/bin/python -m playwright install chromium
+      - name: Prepare isolated synthetic configuration
+        run: |
+          .venv/bin/python - <<'PYSETUP'
+          import os
+          from pathlib import Path
+          import shutil
+          config = Path(os.environ['DOUBAO_CONFIG_PATH'])
+          config.parent.mkdir(parents=True, exist_ok=True)
+          shutil.copyfile('config/config.example.yaml', config)
+          config.chmod(0o600)
+          Path(os.environ['DOUBAO_DATA_DIR']).mkdir(parents=True, exist_ok=True)
+          PYSETUP
+      - name: Run all Python regression tests
+        run: .venv/bin/python -m unittest discover -s tests -p 'test_*.py'
+      - name: Run all JavaScript regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test_file in tests/*.cjs; do
+            node "$test_file"
+          done

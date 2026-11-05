@@ -1,4 +1,4 @@
-# Docker Web/API 预览（未构建、未验证）
+# Docker Web/API 预览（Linux）
 
 此方案仅供学习 Linux 容器部署。镜像不含浏览器、登录状态、模型、ComfyUI、SeedVR2、VSR 或 RapidOCR。容器预览禁用启动生成任务、添加或打开账号、打开桌面文件夹和提交后处理；不要将其视为完整自动化服务。历史清理能力以工作台实际提示为准。
 
@@ -8,9 +8,9 @@
 
 Docker Desktop 的主机网络有额外设置与平台限制，本项目未验证 Windows 或 macOS 下的行为。不要通过关闭访问检查或改为监听所有网卡来解决连接问题。有关范围与限制请参阅 [Docker 主机网络文档](https://docs.docker.com/engine/network/drivers/host/)。
 
-## 仅供后续手动操作
+## 本地构建与启动
 
-需要 Linux Docker Engine、Compose 和网络访问来构建依赖。先复制 `.env.example` 为本机 `.env`，自行填写可选服务地址。`DOUBAO_COMFY_URL` 只是服务地址，不能使缺失的模型、节点和后处理链路自动可用。
+默认 Compose 从本仓库 Dockerfile 构建 `doubao_automation:local`，不拉取需要额外授权的项目 GHCR preview 镜像。需要 Linux Docker Engine、支持 `pull_policy: build` 的 Compose 和网络访问来构建基础依赖。macOS 完整自动化应使用原生启动入口，无需 Docker。先复制 `.env.example` 为本机 `.env`，自行填写可选服务地址。`DOUBAO_COMFY_URL` 只是服务地址，不能使缺失的模型、节点和后处理链路自动可用。
 
 首次启动前需要在命名卷 `/data/config/config.yaml` 中准备私有配置。下面的命令仅在不存在配置时从无密钥模板创建，实际字段需使用者自行填写：
 

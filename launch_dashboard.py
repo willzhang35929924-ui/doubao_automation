@@ -96,7 +96,7 @@ def migrate_legacy_server(state):
     record('检测到本项目旧后台，继续复用；不会自动强制终止进程。')
 
 
-def main():
+def main(open_page=True):
     logs = LOGS_DIR
     logs.mkdir(parents=True, exist_ok=True)
     migrate_legacy_server(checked_state())
@@ -110,6 +110,7 @@ def main():
         with (logs / 'dashboard_service.log').open('a', encoding='utf-8') as log:
             child = subprocess.Popen([str(python), '-u', str(ROOT / 'dashboard_service.py')], cwd=ROOT,
                                      env=env, stdout=log, stderr=subprocess.STDOUT,
+                                     stdin=subprocess.DEVNULL, start_new_session=(os.name != 'nt'),
                                      creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -126,6 +127,8 @@ def main():
     else:
         record('检测到已运行的仪表盘，复用后台服务。')
     record(f'服务已就绪：{URL}')
+    if not open_page:
+        return
     if open_browser():
         record('已向系统发送打开浏览器请求。若没有弹出，请手动打开以上地址。')
     else:

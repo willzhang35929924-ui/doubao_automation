@@ -62,12 +62,18 @@ class AccountQuotaApiTests(unittest.TestCase):
         self.assertTrue(account['login_window_open'])
         self.assertEqual(account['login_status'],'opening')
 
-    def test_confirm_never_resets_quota_or_enables_needs_login(self):
+    def test_confirm_rechecks_browser_without_resetting_quota_or_blindly_enabling(self):
         manager=self.manager('needs_login')
         manager.observe_remaining('test-account',0)
         before=manager.quota('test-account')
-        response=self.client.post('/api/accounts/confirm',json={'name':'test-account'})
-        self.assertEqual(response.status_code,400)
+        job={'ready':threading.Event(),'finished':threading.Event(),'stop':threading.Event()}
+        job['ready'].set()
+        with patch.object(dashboard,'start_login',return_value=job) as start:
+            response=self.client.post('/api/accounts/confirm',json={'name':'test-account'})
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(response.json['status'],'needs_login')
+        start.assert_called_once_with('test-account','profiles/test-account')
+        self.assertFalse(self.cfg['accounts']['doubao'][0]['enabled'])
         self.assertEqual(manager.status('test-account')['status'],'needs_login')
         self.assertEqual(manager.quota('test-account'),before)
         self.assertEqual(self.client.post('/api/accounts/confirm',json={'name':'missing'}).status_code,400)
@@ -98,10 +104,10 @@ class AccountQuotaApiTests(unittest.TestCase):
         manager.observe_remaining('test-account',0)
         session=Mock()
         session.page.is_closed.return_value=False
-        session.has_any_cookie.return_value=True
-        session.page.locator.return_value.count.return_value=1
+        session.context.pages=[session.page]
         job={'stop':threading.Event(),'ready':threading.Event(),'finished':threading.Event()}
-        with patch('doubao_automation.browser_pool.BrowserSession') as browser:
+        with patch('doubao_automation.browser_pool.BrowserSession') as browser, \
+             patch.object(dashboard,'probe_doubao_login',return_value=dict(logged_in=True,note='verified')):
             browser.return_value.start.return_value=session
             dashboard.login_worker('test-account','profiles/test-account',job)
         self.assertTrue(job['verified'])

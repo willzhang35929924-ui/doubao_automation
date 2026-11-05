@@ -12,10 +12,11 @@ from pathlib import Path
 
 from .account_manager import AccountManager
 from .browser_pool import BrowserSession
-from .config import get
+from .config import get, require_doubao_accounts
 from .doubao_agent import DoubaoAgent, GenerationFailed, NeedsLogin, QuotaExhausted
+from .doubao_batch import verified_download_matches
 from .feishu_client import FeishuClient, FeishuError
-from .gemini_web import GeminiError, GeminiNotLoggedIn, GeminiWeb
+from .gemini_web import GeminiError, GeminiNotLoggedIn, GeminiSubmissionUncertain, GeminiWeb
 from .paths import (FRAMES_DIR, ROOT, SCRIPTS_DIR, STATE_DIR, VIDEOS_DIR,
                     ensure_dirs, resolve, safe_filename)
 from .script_splitter import build_segments, parse_scripts, detect_total_seconds
@@ -29,14 +30,24 @@ def _valid_remote_ref(value):
     return isinstance(value,dict) and any(value.get(k) for k in ('key','url','src'))
 
 
+def _uses_source_prompt_column(cfg):
+    """An automatically scanned source column is row data, not a global template."""
+    fixed = get(cfg, 'feishu.fixed_prompt', {}) or {}
+    source = get(cfg, 'feishu.scripts_table', {}) or {}
+    table = str(fixed.get('table_id', '') or '').strip()
+    field = str(fixed.get('field', '') or '').strip()
+    return (fixed.get('source', 'file') == 'bitable'
+            and int(fixed.get('record_index', -1)) < 0
+            and bool(table) and table == str(source.get('table_id', '') or '').strip()
+            and bool(field) and field == str(source.get('prompt_field', '提示词') or '').strip())
+
+
 class Pipeline:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         ensure_dirs()
         self.store = JsonStore(STATE_DIR / "pipeline_state.json", initial=_INITIAL)
         names = [a["name"] for a in (get(cfg, "accounts.doubao") or []) if a.get("enabled", True)]
-        if not names:
-            raise ValueError("config.yaml accounts.doubao 为空")
         self.account_names = names
         self.accounts = AccountManager(JsonStore(STATE_DIR / "accounts.json"), names)
         self.cond = threading.Condition()
@@ -52,10 +63,10 @@ class Pipeline:
             print(f"[fetch] 已有 {len(snap['products'])} 个产品、{len(snap['sources'])} 条源记录，跳过（--force 强制重拉）")
             return
         print("[fetch] 连接飞书，下载产品图 / 提示词 / 视频 / 固定指令 …")
-        fc = FeishuClient(self.cfg)
-        products = fc.fetch_products()
-        sources = fc.fetch_sources()
-        fixed = fc.load_fixed_prompt()
+        with FeishuClient(self.cfg) as fc:
+            products = fc.fetch_products()
+            sources = fc.fetch_sources()
+            fixed = fc.load_fixed_prompt()
         if not products:
             raise FeishuError("产品图表没有下载到任何图片，请检查 feishu.products_table 配置与附件列名")
         with self.store.txn() as data:
@@ -77,12 +88,34 @@ class Pipeline:
         sources = snap.get("sources") or []
         if not sources:
             raise RuntimeError("还没有源数据，请先执行: python run_pipeline.py fetch")
-        fixed = snap.get("fixed_prompt") or ""
-        if not fixed:
+        row_prompt = _uses_source_prompt_column(self.cfg)
+        fixed = "" if row_prompt else snap.get("fixed_prompt") or ""
+        if not fixed and not row_prompt:
             p = resolve(get(self.cfg, "feishu.fixed_prompt.file", "config/gemini_prompt.txt"))
             fixed = p.read_text(encoding="utf-8").strip() if p.exists() else ""
-        if not fixed:
+        if not fixed and not row_prompt:
             raise RuntimeError("固定提示词指令为空：请在 config.yaml 配置来源或写入 config/gemini_prompt.txt")
+
+        existing = list(snap.get("scripts") or [])
+        have_idx = {int(sc.get("source_index", -1)) for sc in existing} if not force else set()
+        scripts_out = [] if force else existing
+        generation = uuid.uuid4().hex[:10] if force else ""
+        todo_idx = [si for si in range(len(sources)) if si not in have_idx]
+        if limit:
+            todo_idx = todo_idx[:limit]
+        messages = {}
+        for si in todo_idx:
+            src = sources[si]
+            extra = (src.get("prompt_text") or "").strip()
+            if row_prompt:
+                if not extra:
+                    raise RuntimeError(f"源记录 {src.get('record_id')} 的提示词为空：固定指令配置指向素材表同一列，不能借用其他记录的提示词")
+                messages[si] = extra
+            else:
+                message = fixed
+                if extra and extra != fixed.strip():
+                    message += "\n\n【本次附加提示词】\n" + extra
+                messages[si] = message
 
         gemini_acct = get(self.cfg, "accounts.gemini") or {}
         session = BrowserSession(
@@ -94,30 +127,17 @@ class Pipeline:
         session.start()
         try:
             gw = GeminiWeb(session, self.cfg)
-            if not gw.logged_in():
-                raise GeminiNotLoggedIn("Gemini 未登录：请先运行 python run_login.py 在弹出的窗口登录 Google 账号")
+            gw.wait_logged_in()
             retries = int(get(self.cfg, "gemini.retry_on_error", 2))
-            existing = list(snap.get("scripts") or [])
-            have_idx = {int(sc.get("source_index", -1)) for sc in existing} if not force else set()
-            scripts_out = [] if force else existing
-            generation = uuid.uuid4().hex[:10] if force else ""
-            todo_idx = [si for si in range(len(sources)) if si not in have_idx]
-            if limit:
-                todo_idx = todo_idx[:limit]
             for si in todo_idx:
                 src = sources[si]
-                message = fixed or ""
-                extra = (src.get("prompt_text") or "").strip()
-                if extra and extra != (fixed or "").strip():
-                    message += "\n\n【本次附加提示词】\n" + extra
-                if not message.strip():
-                    message = "（表中提示词为空，请仅依据视频生成脚本）"
+                message = messages[si]
                 text = ""
                 for attempt in range(retries + 1):
                     try:
                         text = gw.generate(src.get("videos") or [], message)
                         break
-                    except GeminiNotLoggedIn:
+                    except (GeminiNotLoggedIn, GeminiSubmissionUncertain):
                         raise
                     except GeminiError as e:
                         print(f"[scripts] 源 {src.get('record_id')} 第 {attempt + 1} 次失败: {e}")
@@ -408,7 +428,7 @@ class Pipeline:
         for task in self.store.snapshot().get('tasks',[]):
             if task['status']=='done':continue
             raw=Path(task.get('raw_video') or VIDEOS_DIR/f"{task['script_id']}_seg{task['seg_index']}.raw.mp4")
-            if raw.is_file():
+            if verified_download_matches(raw, task.get('remote_ref', {})):
                 try:self._finalize_local(task,raw)
                 except Exception as exc:self._finish(task['id'],status='local_failed',raw_video=str(raw),error=str(exc)[:500])
 
@@ -424,7 +444,9 @@ class Pipeline:
                     batch=[by_id[tid] for tid in request.get('task_ids',[]) if tid in by_id
                            and by_id[tid].get('request_id')==rid]
                     if not batch or all(t['status']=='done' for t in batch):continue
-                    if any(t.get('raw_video') and Path(t['raw_video']).is_file() and t['status']!='done' for t in batch):
+                    if any(t['status'] != 'done' and verified_download_matches(
+                            Path(t.get('raw_video') or VIDEOS_DIR/f"{t['script_id']}_seg{t['seg_index']}.raw.mp4"),
+                            t.get('remote_ref', {})) for t in batch):
                         continue  # A local trim/frame failure must not cause more generation.
                     if request.get('phase') in ('reserved','submitted','unknown','downloading'):
                         for task in batch:
@@ -708,6 +730,7 @@ class Pipeline:
                 if task['id'] in ids:task.update(status='pending',account='',request_id='',error=error[:500])
 
     def stage_run(self):
+        require_doubao_accounts(self.cfg)
         with self._run_lock():
             return self._stage_run_locked()
 
@@ -739,11 +762,12 @@ class Pipeline:
             extra = t.get("video") or t.get("error") or ""
             print(f"  {mark} {t['id']:<14} [{t['status']:<7}] {extra}")
         print("账号状态:")
-        print(self.accounts.blocked_report())
+        print(self.accounts.blocked_report() or "  暂无启用的豆包账号，请在工作台「账号库」添加账号并完成登录验证。")
         if pending or failed:
             print("\n提示: 待执行任务会在账号额度恢复（次日）或重新登录后，重跑 python run_pipeline.py run 自动续接。")
 
     def run_all(self, force: bool = False, from_saved: bool = False, limit: int = 0):
+        require_doubao_accounts(self.cfg)
         with self._run_lock():
             return self._run_all_locked(force=force,from_saved=from_saved,limit=limit)
 

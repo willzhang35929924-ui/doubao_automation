@@ -21,7 +21,9 @@ class DashboardTests(unittest.TestCase):
         self.patchers = [patch.object(dashboard, 'STATE_DIR', self.path),
                          patch.object(dashboard, 'LOGS_DIR', self.path),
                          patch.object(dashboard, 'proc', None),
-                         patch.object(dashboard.postprocess, 'STORE_PATH', self.path / 'postprocess.json')]
+                         patch.object(dashboard.postprocess, 'STORE_PATH', self.path / 'postprocess.json'),
+                         patch.object(dashboard, 'load_config', return_value={
+                             'accounts': {'doubao': [{'name': 'fixture', 'profile': 'profiles/fixture'}]}})]
         for p in self.patchers:
             p.start()
         self.client = dashboard.app.test_client()
@@ -64,7 +66,7 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(self.client.post('/api/edit',json={'rows':[]}).status_code,400)
 
     def test_saved_pipeline_skips_remote_fetch(self):
-        p=Pipeline.__new__(Pipeline);p.store=dashboard.store()
+        p=Pipeline.__new__(Pipeline);p.store=dashboard.store();p.cfg=dashboard.load_config()
         p.stage_fetch=Mock();p.stage_scripts=Mock();p.stage_plan=Mock();p.stage_run=Mock()
         p.run_all(force=True,from_saved=True,limit=1)
         p.stage_fetch.assert_not_called()
@@ -134,7 +136,7 @@ class DashboardTests(unittest.TestCase):
                 r=self.client.post('/api/open-video',json={'path':str(p)})
                 self.assertEqual(r.status_code,200)
                 reveal.assert_called_once_with(p.resolve())
-                self.assertEqual(r.json['folder'],str(self.path))
+                self.assertEqual(r.json['folder'],str(self.path.resolve()))
             with patch.object(dashboard,'open_video_folder',side_effect=OSError('0x80070005')):
                 r=self.client.post('/api/open-video',json={'path':str(p)})
                 self.assertEqual(r.status_code,500)

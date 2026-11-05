@@ -10,7 +10,10 @@ from doubao_automation.doubao_batch import BatchGenerationMixin,batch_prompt,cho
 
 
 def asset(url,index=0):
-    return {'url':url,'stable':url.split('?')[0],'video_index':index,'message_id':'','duration':15}
+    return {'url':url,'stable':url.split('?')[0],'video_index':index,
+            'message_id':'fixture-'+hashlib.sha256(url.split('?')[0].encode()).hexdigest()[:12],
+            'message_ordinal':0,'duration':15,'ownership_verified':True,
+            'owner_user_message_id':'fixture-owner'}
 
 
 class Page:
@@ -126,7 +129,8 @@ class BatchTests(unittest.TestCase):
     def test_failed_first_card_does_not_steal_successful_second_slot(self):
         failed={'kind':'card','status':'failed','card_position':0}
         ready={'kind':'card','status':'ready','card_position':1,'stable':'card:msg:1','url':'',
-               'card_message_id':'msg','card_ordinal':1,'receive_index':0}
+               'card_message_id':'msg','card_ordinal':1,'receive_index':0,
+               'ownership_verified':True,'owner_user_message_id':'fixture-owner'}
         agent=Agent([([],[]),([ready],[failed,ready])],['你的内容已生成完毕，其中1个视频生成失败，失败视频的生成额度未扣除。'])
         result,generated,_=self.run_agent(agent)
         self.assertEqual([tid for tid,_ in generated],[self.tasks[1]['id']])
@@ -136,7 +140,8 @@ class BatchTests(unittest.TestCase):
 
     def test_resume_filtered_request_keeps_original_card_slot_order(self):
         ready={'kind':'card','status':'ready','card_position':1,'stable':'card:msg:1','url':'',
-               'card_message_id':'msg','card_ordinal':1,'receive_index':0}
+               'card_message_id':'msg','card_ordinal':1,'receive_index':0,
+               'ownership_verified':True,'owner_user_message_id':'fixture-owner'}
         failed={'kind':'card','status':'failed','card_position':0}
         agent=Agent([([ready],[failed,ready])])
         second=self.tasks[1];self.tasks=[second]

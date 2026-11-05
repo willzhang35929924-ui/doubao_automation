@@ -18,6 +18,9 @@ const ctx = vm.createContext({document:{querySelector:element,activeElement:null
     if (path !== '/api/sync') throw Error('unexpected request');
     syncCalls++;
     assert.equal(options.headers['X-CSRF-Token'],'test-csrf');
+    assert.equal(options.referrerPolicy,'same-origin','Safari POST must preserve its local Origin');
+    assert.equal(options.mode,'same-origin');
+    assert.equal(options.credentials,'same-origin');
     if (mode === 'pending') return await new Promise(resolve => { release = resolve; });
     if (mode === 'network') throw Error('Failed to fetch');
     return {ok:false,status:400,json:async()=>({error:'请配置飞书应用凭证'})};

@@ -1,6 +1,6 @@
 """Gemini 网页版自动化：上传源视频 + 固定指令 + 提示词 → 抓取生成的多个脚本。
 
-选择器全部来自 config.yaml gemini.selectors，页面改版只需改配置。
+内置常用中英文控件定位，config.yaml gemini.selectors 可覆盖默认选择器。
 实机校准：python run_pipeline.py inspect-gemini
 """
 import sys
@@ -8,6 +8,7 @@ import time
 import re
 import json
 import hashlib
+import mimetypes
 import uuid
 from datetime import datetime
 from pathlib import Path, PureWindowsPath
@@ -23,6 +24,23 @@ class GeminiError(Exception):
 
 class GeminiNotLoggedIn(GeminiError):
     pass
+
+
+class GeminiSubmissionUncertain(GeminiError):
+    """A send was attempted; automatic retries could duplicate an accepted request."""
+
+
+_PROMPT_EDITOR = '[contenteditable="true"][role="textbox"], textarea'
+_UPLOAD_OPENERS = [
+    'button[aria-label="上传和工具"]',
+    'button[aria-label="Upload & tools"]',
+    'button[aria-label="Add files"]',
+    'button[aria-label="添加文件"]',
+]
+_SEND_BUTTONS = [
+    'button[aria-label="发送"]', 'button[aria-label="Send"]',
+    'button[aria-label="发送消息"]', 'button[aria-label="Send message"]',
+]
 
 
 def _combine(selectors) -> str:
@@ -53,6 +71,8 @@ def _explicit_script_count(message):
         values=[number(value) for value in re.findall(pattern,section)]
         values += [int(value) for value in re.findall(r'\b(?:write|generate|create|produce)\s+(\d{1,3})\s+(?:video\s+)?scripts\b',section,re.I)]
         values={value for value in values if 0<value<=100}
+        durations=_requested_durations(section)
+        if values=={1} and len(durations)==2:return 2  # one of each duration, not one script total
         if len(values)==1:return values.pop()
         if values:return None  # conflicting instructions must not become a guessed hard limit
         if len(sections)>1 and index==0:
@@ -69,9 +89,17 @@ def _requested_durations(message, requested_count=None):
         if values:return values
         # A common natural request is "生成1个50秒和一个70秒的视频".
         # Only infer the pair when it doesn't conflict with an explicit script count.
-        if requested_count not in (None,2):continue
         pair=re.search(r'(?:生成|输出|写|制作|创作)[^。；\n]{0,24}?(?:1|一)(?:个|条)\s*(\d+)\s*秒(?:的)?(?:视频|脚本)?\s*(?:和|与|、|以及)\s*(?:1|一)(?:个|条)\s*(\d+)\s*秒',section)
-        if pair:return [int(pair.group(1)),int(pair.group(2))]
+        if pair:
+            if requested_count in (None,2):return [int(pair.group(1)),int(pair.group(2))]
+            continue
+        repeated=re.findall(r'(?:生成|输出|写|制作|创作)\s*(?:再)?\s*(\d{1,3}|[一二两三四五六七八九十])(?:个|条|篇|份)\s*(\d+)\s*秒',section)
+        repeated={(int(count) if count.isdigit() else {'一':1,'二':2,'两':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9,'十':10}[count],int(seconds)) for count,seconds in repeated}
+        if repeated:
+            if len(repeated)==1:
+                count,seconds=repeated.pop()
+                if 0<count<=100 and requested_count in (None,count):return [seconds]*count
+            return []
     return []
 
 
@@ -106,6 +134,7 @@ class GeminiWeb:
         self.audit_dir = _resolve_audit_dir(self.gcfg.get('audit_dir'))
         self._sent_baseline = None
         self._last_observed_response = ''
+        self._submission_attempted = False
 
     def _capture_diagnostic(self,stage,response='',error=''):
         """Persist failures locally; never export cookies, storage or authentication query strings."""
@@ -141,10 +170,62 @@ class GeminiWeb:
         return self.session.page
 
     def logged_in(self) -> bool:
-        return self.session.has_any_cookie(
-            "https://gemini.google.com",
-            get(self.cfg, "login.gemini_logged_in_cookies", ["__Secure-1PSID"]),
-        )
+        names = get(self.cfg, "login.gemini_logged_in_cookies") or ["__Secure-1PSID", "__Secure-3PSID", "SID"]
+        if isinstance(names, str):
+            names = [names]
+        return self.session.has_any_cookie("https://gemini.google.com", names)
+
+    def _login_pages(self):
+        context = getattr(self.session, 'context', None)
+        pages = list(context.pages) if context is not None else [self.page]
+        return [page for page in pages if not page.is_closed()]
+
+    def login_ready(self) -> bool:
+        """A Google cookie alone or the anonymous Gemini editor is insufficient."""
+        editor = _combine(self.sel.get('prompt_editor')) or _PROMPT_EDITOR
+        for page in self._login_pages():
+            try:
+                url = urlsplit(page.url)
+                if url.scheme not in ('http', 'https') or url.hostname != 'gemini.google.com':
+                    continue
+                if any(part in url.path.lower() for part in ('signin', 'login')):
+                    continue
+                if not self.logged_in():
+                    continue
+                boxes = page.locator(editor)
+                if any(boxes.nth(i).is_visible() and boxes.nth(i).is_enabled() for i in range(boxes.count())):
+                    self.session.page = page
+                    return True
+            except Exception:
+                # Navigation can replace the document while login is completing.
+                continue
+        return False
+
+    def wait_logged_in(self):
+        """Keep the visible browser usable while the user signs in; never send."""
+        headless = bool(get(self.cfg, 'browser.headless', False))
+        timeout = (float(get(self.cfg, 'gemini.startup_timeout_seconds', 30)) if headless
+                   else float(get(self.cfg, 'login.timeout_minutes', 30)) * 60)
+        deadline = time.monotonic() + max(0, timeout)
+        announced = False
+        while True:
+            pages = self._login_pages()
+            if not pages:
+                raise GeminiNotLoggedIn('Gemini 登录窗口已关闭，尚未发送任何生成请求；请重新开启运行并完成 Google 登录')
+            if self.login_ready():
+                if announced:
+                    print('[scripts] Gemini 登录与输入框已就绪，继续处理素材', flush=True)
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GeminiNotLoggedIn(f'等待 Gemini 登录或页面就绪超时（{timeout:g} 秒），未发送任何生成请求；请在有界面模式登录 Google 后重试')
+            if not announced:
+                message = ('无界面模式下等待 Gemini 页面就绪；如未登录，请先用有界面模式完成 Google 登录'
+                           if headless else '请在打开的 Gemini 窗口完成 Google 登录；窗口会保留，登录就绪后自动继续。协议或条款请自行确认')
+                print(f'[scripts] {message}（最多等待 {timeout:g} 秒）', flush=True)
+                announced = True
+            # Keep Playwright's event loop alive, including redirects and popups.
+            pages[0].wait_for_timeout(min(1, remaining) * 1000)
 
     def open(self):
         page = self.page
@@ -153,7 +234,7 @@ class GeminiWeb:
         cur = page.url
         if "accounts.google.com" in cur or "signin" in cur.lower():
             raise GeminiNotLoggedIn("Gemini 未登录：请先运行 python run_login.py 在弹出的窗口中登录 Google 账号")
-        editor = _combine(self.sel.get("prompt_editor")) or 'rich-textarea [contenteditable="true"], [contenteditable="true"][role="textbox"]'
+        editor = _combine(self.sel.get("prompt_editor")) or _PROMPT_EDITOR
         if editor:
             try:
                 page.locator(editor).first.wait_for(state="visible", timeout=20000)
@@ -162,94 +243,138 @@ class GeminiWeb:
                 raise GeminiNotLoggedIn('Gemini输入框不可用，可能需要人工登录或确认新条款；未自动点击同意/继续') from exc
 
     # ---- 上传 ----
+    @staticmethod
+    def _input_accepts(loc, paths):
+        accept = (loc.get_attribute('accept') or '').lower()
+        tokens = {part.strip() for part in accept.split(',') if part.strip()}
+        if len(paths) > 1 and loc.get_attribute('multiple') is None:
+            return False
+        for path in paths:
+            mime = mimetypes.guess_type(str(path))[0] or 'application/octet-stream'
+            extension = Path(path).suffix.lower()
+            if tokens and not any(token in ('*/*', mime, extension)
+                                  or (token.endswith('/*') and mime.startswith(token[:-1]))
+                                  for token in tokens):
+                return False
+        return True
+
+    def _set_upload_input(self, paths):
+        inputs = self.page.locator(_combine(self.sel.get('file_input')) or 'input[type="file"]')
+        for index in range(inputs.count()):
+            loc = inputs.nth(index)
+            if self._input_accepts(loc, paths):
+                # Do not try a second input after a partial/ambiguous upload.
+                loc.set_input_files([str(path) for path in paths], timeout=30000)
+                return True
+        return False
+
+    def _wait_uploads(self, paths):
+        editor = self.page.locator(_combine(self.sel.get('prompt_editor')) or _PROMPT_EDITOR).filter(visible=True).first
+        names = [Path(path).name for path in paths]
+        deadline = time.monotonic() + float(self.gcfg.get('upload_timeout_seconds', 300))
+        stable_seconds = max(0, float(self.gcfg.get('upload_settle_seconds', 1.5)))
+        ready_since = None
+        while time.monotonic() < deadline:
+            state = editor.evaluate('''(editor, {names, videos, baseline}) => {
+              const root = editor.closest('[data-node-type="input-area"], fieldset, form');
+              if (!root) return {ready: false, error: ''};
+              const visible = e => !!(e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden');
+              const elements = [...root.querySelectorAll('*')].filter(visible);
+              const outsideDraft = e => !e.closest('rich-textarea, [contenteditable], textarea, input');
+              const attached = names.every(name => elements.some(e => outsideDraft(e) &&
+                (e.getAttribute('title') === name || (e.getAttribute('aria-label') || '').includes(name) ||
+                 (!e.children.length && (e.textContent || '').trim() === name))));
+              // Gemini's video tile shows only a thumbnail and duration, not a filename.
+              const previews = elements.filter(e => e.matches('uploader-file-preview'));
+              const newVideos = videos && previews.length - baseline === names.length &&
+                previews.slice(baseline).every(e => {
+                  const image = e.querySelector('gem-media-attachment img');
+                  return e.querySelector('gem-media-attachment .time-overlay') &&
+                    image && image.complete && image.naturalWidth > 0;
+                });
+              const busy = elements.some(e => e.matches('[role="progressbar"], mat-progress-spinner, mat-spinner, [aria-busy="true"], .gem-attachment-content.loading'));
+              const error = elements.filter(e => e.matches('[role="alert"]')).map(e => e.textContent.trim()).join(' ');
+              return {ready: (attached || newVideos) && !busy && !error, error};
+            }''', dict(names=names,
+                       videos=all((mimetypes.guess_type(str(path))[0] or '').startswith('video/') for path in paths),
+                       baseline=getattr(self, '_upload_preview_baseline', 0)))
+            if state['error']:
+                raise GeminiError('Gemini 附件上传报错：' + state['error'])
+            if state['ready']:
+                if ready_since is None:
+                    ready_since = time.monotonic()
+                if time.monotonic() - ready_since >= stable_seconds:
+                    print(f'[Gemini] 已确认 {len(paths)} 个附件可见且上传进度已结束', flush=True)
+                    return
+            else:
+                ready_since = None
+            self.page.wait_for_timeout(500)
+        raise GeminiError('Gemini 附件未在时限内确认上传完成；未发送提示词，请检查本地诊断')
+
     def upload_files(self, paths: list):
-        """三层策略：A 常驻 input 直接注入 → B 点入口捕获系统文件选择框 → C 点菜单项捕获。"""
+        """Wait for hydrated controls, choose a media-compatible input, then prove attachment readiness."""
+        if not paths:
+            return
+        paths = [Path(path) for path in paths]
+        if any(not path.is_file() for path in paths):
+            raise GeminiError('Gemini 待上传文件不存在，未提交上传或提示词')
         page = self.page
-        files = [str(p) for p in paths]
-        file_input = _combine(self.sel.get("file_input")) or 'input[type="file"]'
-        menu_items = _selectors(self.sel.get("upload_menu_items"))
+        editor = page.locator(_combine(self.sel.get('prompt_editor')) or _PROMPT_EDITOR).filter(visible=True).first
+        self._upload_preview_baseline = editor.evaluate('''editor => {
+          const root = editor.closest('[data-node-type="input-area"], fieldset, form');
+          return root ? [...root.querySelectorAll('uploader-file-preview')].filter(e => e.getClientRects().length).length : 0;
+        }''')
+        openers = _selectors(self.sel.get('open_upload')) or _UPLOAD_OPENERS
+        deadline = time.monotonic() + float(self.gcfg.get('upload_control_timeout_seconds', 30))
         ok = False
-        # A) 页面已有 file input
-        try:
-            loc = page.locator(file_input)
-            if loc.count() > 0:
-                loc.first.set_input_files(files, timeout=8000)
+        while time.monotonic() < deadline:
+            if self._set_upload_input(paths):
                 ok = True
-        except Exception:
-            pass
-        # B/C) 点 "Upload & tools" 等入口
-        if not ok:
-            for opener in _selectors(self.sel.get("open_upload")):
-                if ok:
-                    break
+                break
+            buttons = page.locator(_combine(openers)).filter(visible=True)
+            if buttons.count() and buttons.first.is_enabled():
+                chooser = None
                 try:
-                    btn = page.locator(opener).first
-                    if btn.count() == 0 or not btn.is_visible():
-                        continue
+                    with page.expect_file_chooser(timeout=1500) as event:
+                        buttons.first.click(timeout=5000)
+                    chooser = event.value
                 except Exception:
-                    continue
-                # B) 点击直接弹系统文件框
-                try:
-                    with page.expect_file_chooser(timeout=6000) as fc:
-                        btn.click(timeout=4000)
-                    fc.value.set_files(files)
-                    ok = True
-                    break
-                except Exception:
+                    # The normal current UI opens a menu, not a system dialog.
                     pass
-                # C) 打开了菜单 → 逐个菜单项尝试
-                page.wait_for_timeout(1200)
-                for label in menu_items:
-                    if ok:
-                        break
-                    item = None
-                    for finder in (lambda: page.get_by_role("menuitem", name=label),
-                                   lambda: page.get_by_text(label, exact=False)):
-                        try:
-                            cand = finder()
-                            if cand.count() > 0 and cand.first.is_visible():
-                                item = cand.first
-                                break
-                        except Exception:
+                if chooser is not None:
+                    if not self._input_accepts(chooser.element, paths):
+                        raise GeminiError('上传入口不接受当前视频类型，未选择文件')
+                    chooser.set_files([str(path) for path in paths])
+                    ok = True
+                elif self._set_upload_input(paths):
+                    ok = True
+                else:
+                    labels = _selectors(self.sel.get('upload_menu_items')) or ['上传文件', 'Upload files']
+                    for label in labels:
+                        items = page.get_by_role('menuitem', name=re.compile(r'^' + re.escape(label) + r'(?:[.。]|$)')).filter(visible=True)
+                        if not items.count():
                             continue
-                    if item is None:
-                        continue
-                    try:
-                        with page.expect_file_chooser(timeout=8000) as fc2:
-                            item.click(timeout=4000)
-                        fc2.value.set_files(files)
+                        with page.expect_file_chooser(timeout=8000) as event:
+                            items.first.click(timeout=5000)
+                        chooser = event.value
+                        if not self._input_accepts(chooser.element, paths):
+                            raise GeminiError('上传菜单不接受当前视频类型，未选择文件')
+                        chooser.set_files([str(path) for path in paths])
                         ok = True
-                    except Exception:
-                        try:
-                            loc = page.locator(file_input)
-                            if loc.count() > 0:
-                                loc.first.set_input_files(files, timeout=4000)
-                                ok = True
-                        except Exception:
-                            pass
-                if not ok:  # 菜单点开后可能出现了常驻 input
-                    try:
-                        loc = page.locator(file_input)
-                        if loc.count() > 0:
-                            loc.first.set_input_files(files, timeout=4000)
-                            ok = True
-                    except Exception:
-                        pass
-                if not ok:
-                    try:
-                        page.keyboard.press("Escape")
-                    except Exception:
-                        pass
+                        break
+                break
+            page.wait_for_timeout(250)
         if not ok:
-            raise GeminiError("无法完成 Gemini 文件上传，请运行 dryrun-gemini / inspect-gemini 校准选择器")
-        settle = float(self.gcfg.get("upload_settle_seconds", 8)) * max(len(paths), 1)
-        print(f"[Gemini] 已提交 {len(paths)} 个文件，等待上传完成（约 {settle:.0f}s）…")
-        page.wait_for_timeout(int(settle * 1000))
+            raise GeminiError('无法找到可用的 Gemini 视频上传入口，请运行 inspect-gemini 检查页面')
+        page.keyboard.press('Escape')
+        print(f'[Gemini] 已选择 {len(paths)} 个文件，等待实际附件上传完成…', flush=True)
+        self._wait_uploads(paths)
 
     # ---- 发送与等待 ----
     def type_prompt(self,text):
-        editor=_combine(self.sel.get('prompt_editor')) or 'rich-textarea [contenteditable="true"]'
-        loc=self.page.locator(editor).first
+        editor=_combine(self.sel.get('prompt_editor')) or _PROMPT_EDITOR
+        matches=self.page.locator(editor)
+        loc=next((matches.nth(i) for i in range(matches.count()) if matches.nth(i).is_visible()), matches.first)
         loc.click(timeout=10000)
         try:loc.fill(text,timeout=10000)
         except Exception:
@@ -313,32 +438,30 @@ class GeminiWeb:
         self._sent_baseline=self._response_snapshot()
         self.type_prompt(text)
         sent=False
-        buttons=_selectors(self.sel.get('send_button')) or ['button[aria-label="Send message"]','button[aria-label="发送消息"]']
+        buttons=_selectors(self.sel.get('send_button')) or _SEND_BUTTONS
         ready_deadline=time.monotonic()+float(self.gcfg.get('send_ready_timeout_seconds',180))
         while time.monotonic()<ready_deadline:
-            visible=False
             for selector in buttons:
                 try:
                     matches=self.page.locator(selector)
                     for index in range(matches.count()):
                         button=matches.nth(index)
                         if not button.is_visible():continue
-                        visible=True
                         if not button.is_enabled():continue
                         # A click timeout can happen after the request was accepted.
                         # Attempt once, then confirm via the conversation instead of resending.
                         sent=True
+                        self._submission_attempted=True
                         try:button.click(timeout=5000)
                         except Exception:pass
                         break
                 except Exception:continue
                 if sent:break
-            if sent or not visible:break
+            if sent:break
             self.page.wait_for_timeout(500)
         else:
-            self._capture_diagnostic('send_not_ready',error='Send control stayed disabled after upload/draft')
-            raise GeminiError('上传或发送按钮迟迟未就绪；未用回车绕过禁用按钮，已保存诊断')
-        if not sent:self.page.keyboard.press('Enter')
+            self._capture_diagnostic('send_not_ready',error='Send control missing or disabled after upload/draft')
+            raise GeminiError('上传或发送按钮迟迟未就绪；未用回车绕过缺失或禁用按钮，已保存诊断')
         # A successful click is not proof that Gemini accepted the request.
         deadline=time.monotonic()+float(self.gcfg.get('send_ack_timeout_seconds',20))
         while time.monotonic()<deadline:
@@ -392,15 +515,25 @@ class GeminiWeb:
     def generate(self,video_paths,message_text):
         requested_count=_explicit_script_count(message_text)
         targets=_requested_durations(message_text,requested_count)
-        message_text+=('\n\n【自动化脚本输出规范】用户本次附加提示词中的数量和总时长优先。'
-                       '完整保留指定的50秒、70秒等总时长，不因豆包单次15秒限制而压缩。'
+        constraints=''
+        if requested_count is not None:
+            constraints+=f'本次最终只输出{requested_count}个脚本。'
+        if targets:
+            constraints+='本次各脚本总时长按顺序为'+ '、'.join(f'{value}秒' for value in targets)+'。'
+        message_text+=('\n\n【自动化脚本输出规范】本次附加提示词优先于固定指令；发生冲突时忽略固定指令的旧数量和旧时长。'
+                       +constraints+
+                       '以下约束是本次最终要求，禁止额外输出其他数量或时长的版本。'
+                       '严格保留本次指定的总时长，不因豆包单次15秒限制而压缩。'
                        '每个脚本使用独立标题Script 01：标题（总时长N秒），正文单列“总时长：N秒”。'
                        '时间轴从00:00开始连续覆盖到总时长，按每5秒一个时间块，最后不足5秒按实际写；'
                        '每块分别列摄影与构图、视觉与动作、照明与氛围、音频与口播。'
                        '脚本独立完整，禁止省略、同上、合并或缩写为15秒。')
         self._sent_baseline=None;self._last_observed_response=''
+        self._submission_attempted=False
         try:
             self.open()
+            self.type_prompt(message_text)
+            print('[Gemini] 提示词草稿已填写，附件就绪前不会发送', flush=True)
             if video_paths:self.upload_files(video_paths)
             self.send_prompt(message_text)
             response=self.wait_response()
@@ -425,6 +558,8 @@ class GeminiWeb:
             return response
         except Exception as exc:
             self._capture_diagnostic('failed',response=self._last_observed_response,error=str(exc))
+            if self._submission_attempted:
+                raise GeminiSubmissionUncertain(f'{exc}；已尝试发送，本次停止自动重试，请先核对 Gemini 对话与本地诊断') from exc
             raise
 
     # ---- 实机勘察 ----
