@@ -25,14 +25,16 @@ jobs:
     env:
       CI: "true"
       PYTHONDONTWRITEBYTECODE: "1"
-      DOUBAO_DATA_DIR: ${{ runner.temp }}/doubao-ci/data
-      DOUBAO_CONFIG_PATH: ${{ runner.temp }}/doubao-ci/config/config.yaml
     steps:
       # Fixed official release commits; update with review rather than mutable tags.
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Configure isolated runtime paths
+        shell: bash
+        run: |
+          printf '%s\n' "DOUBAO_DATA_DIR=$RUNNER_TEMP/doubao-ci/data" "DOUBAO_CONFIG_PATH=$RUNNER_TEMP/doubao-ci/config/config.yaml" >> "$GITHUB_ENV"
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
