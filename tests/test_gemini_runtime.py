@@ -14,8 +14,10 @@ from doubao_automation import gemini_web as module
 from doubao_automation.gemini_web import GeminiWeb,GeminiError,GeminiNotLoggedIn
 
 
-def snapshot(texts,users=1):
+def snapshot(texts,users=1,user_texts=None,attachment_counts=None):
     return dict(model_count=len(texts),user_count=users,texts=texts,selector='model-response',
+                user_texts=user_texts if user_texts is not None else ['prior message']*users,
+                user_attachment_counts=attachment_counts if attachment_counts is not None else [0]*users,
                 response_hashes=[hashlib.sha256(t.encode()).hexdigest() for t in texts])
 
 
@@ -149,6 +151,61 @@ class GeminiRuntimeTests(unittest.TestCase):
                          ['open','type_prompt','upload_files','send_prompt','wait_response'])
         self.assertIn('fixture instruction',self.agent.type_prompt.call_args.args[0])
         self.assertEqual(self.agent.type_prompt.call_args.args,self.agent.send_prompt.call_args.args)
+
+    def test_matching_manual_submission_is_adopted_during_upload_wait(self):
+        self.agent._expected_prompt='full prepared prompt'
+        self.agent._sent_baseline=snapshot([],users=1,user_texts=['prior message'])
+        self.agent._response_snapshot=Mock(return_value=snapshot(
+            [],users=2,user_texts=['prior message','full prepared prompt']))
+        self.assertTrue(self.agent._check_for_external_submission())
+        self.assertTrue(self.agent._external_submission_accepted)
+        self.assertTrue(self.agent._submission_attempted)
+
+    def test_ambiguous_manual_submission_is_uncertain(self):
+        self.agent._expected_prompt='full prepared prompt'
+        self.agent._sent_baseline=snapshot([],users=1,user_texts=['prior message'])
+        self.agent._response_snapshot=Mock(return_value=snapshot(
+            [],users=2,user_texts=['prior message','different prompt']))
+        with self.assertRaisesRegex(module.GeminiSubmissionUncertain,'无法唯一匹配'):
+            self.agent._check_for_external_submission()
+        self.assertTrue(self.agent._submission_attempted)
+
+    def test_disappeared_draft_without_visible_matching_turn_is_uncertain(self):
+        self.agent._expected_prompt='full prepared prompt'
+        self.agent._sent_baseline=snapshot([],users=0,user_texts=[])
+        self.agent._response_snapshot=Mock(return_value=snapshot([],users=0,user_texts=[]))
+        with self.assertRaisesRegex(module.GeminiSubmissionUncertain,'草稿已消失'):
+            self.agent._check_for_external_submission()
+        self.assertTrue(self.agent._submission_attempted)
+
+    def test_manual_submission_requires_all_expected_attachments(self):
+        self.agent._expected_prompt='full prepared prompt'
+        self.agent._expected_attachment_count=7
+        self.agent._sent_baseline=snapshot([],users=0,user_texts=[])
+        for counts in ([], [6], [8]):
+            with self.subTest(counts=counts):
+                self.agent._response_snapshot=Mock(return_value=snapshot(
+                    [],users=1,user_texts=['full prepared prompt'],attachment_counts=counts))
+                with self.assertRaisesRegex(module.GeminiSubmissionUncertain,'全部附件'):
+                    self.agent._check_for_external_submission()
+        self.agent._response_snapshot=Mock(return_value=snapshot(
+            [],users=1,user_texts=['full prepared prompt'],attachment_counts=[7]))
+        self.assertTrue(self.agent._check_for_external_submission())
+
+    def test_generate_adopts_manual_send_without_calling_send_again(self):
+        self.agent.open=Mock()
+        self.agent.type_prompt=Mock()
+        self.agent.send_prompt=Mock()
+        self.agent.wait_response=Mock(return_value='fixture response')
+        def upload(_):
+            self.agent._response_snapshot=Mock(return_value=snapshot(
+                [],users=1,user_texts=[self.agent._expected_prompt],attachment_counts=[1]))
+            self.assertTrue(self.agent._check_for_external_submission())
+        self.agent.upload_files=Mock(side_effect=upload)
+        with patch.object(self.agent,'_capture_diagnostic'):
+            self.agent.generate(['fixture.mp4'],'fixture instruction')
+        self.agent.send_prompt.assert_not_called()
+        self.agent.wait_response.assert_called_once_with()
 
     def test_generate_does_not_allow_retry_after_an_attempted_send(self):
         self.agent.open=Mock()

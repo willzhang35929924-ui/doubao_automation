@@ -135,14 +135,23 @@ class GeminiWeb:
         self._sent_baseline = None
         self._last_observed_response = ''
         self._submission_attempted = False
+        self._external_submission_accepted = False
+        self._expected_prompt = ''
+        self._expected_attachment_count = 0
 
     def _capture_diagnostic(self,stage,response='',error=''):
         """Persist failures locally; never export cookies, storage or authentication query strings."""
         prefix=datetime.now().strftime('gemini_%Y%m%d_%H%M%S_')+uuid.uuid4().hex[:8]+'_'+stage
         raw=response or self._last_observed_response
+        baseline=self._sent_baseline
+        safe_baseline=({key:baseline.get(key) for key in ('model_count','user_count','selector')}
+                       if isinstance(baseline,dict) else baseline)
+        if isinstance(safe_baseline,dict) and isinstance(baseline,dict):
+            safe_baseline['user_text_hashes']=[hashlib.sha256(str(text).encode('utf-8')).hexdigest()
+                                               for text in baseline.get('user_texts',[]) or []]
         payload=dict(stage=stage,error=str(error),response_chars=len(raw),
                      response_sha256=hashlib.sha256(raw.encode('utf-8')).hexdigest(),
-                     baseline=self._sent_baseline)
+                     baseline=safe_baseline)
         try:self.audit_dir.mkdir(parents=True,exist_ok=True)
         except OSError as exc:
             print(f'[Gemini] 本地诊断目录不可写：{type(exc).__name__}',flush=True)
@@ -274,32 +283,55 @@ class GeminiWeb:
         deadline = time.monotonic() + float(self.gcfg.get('upload_timeout_seconds', 300))
         stable_seconds = max(0, float(self.gcfg.get('upload_settle_seconds', 1.5)))
         ready_since = None
+        next_status = time.monotonic() + 10
         while time.monotonic() < deadline:
-            state = editor.evaluate('''(editor, {names, videos, baseline}) => {
+            if self._check_for_external_submission():
+                return
+            kinds = [mimetypes.guess_type(str(path))[0] or 'application/octet-stream' for path in paths]
+            try:
+                state = editor.evaluate('''(editor, {names, kinds, baseline}) => {
               const root = editor.closest('[data-node-type="input-area"], fieldset, form');
               if (!root) return {ready: false, error: ''};
               const visible = e => !!(e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden');
               const elements = [...root.querySelectorAll('*')].filter(visible);
-              const outsideDraft = e => !e.closest('rich-textarea, [contenteditable], textarea, input');
-              const attached = names.every(name => elements.some(e => outsideDraft(e) &&
-                (e.getAttribute('title') === name || (e.getAttribute('aria-label') || '').includes(name) ||
-                 (!e.children.length && (e.textContent || '').trim() === name))));
-              // Gemini's video tile shows only a thumbnail and duration, not a filename.
+              // Require one newly rendered preview per selected file. A filename or
+              // file-input selection alone does not prove that media finished loading.
               const previews = elements.filter(e => e.matches('uploader-file-preview'));
-              const newVideos = videos && previews.length - baseline === names.length &&
-                previews.slice(baseline).every(e => {
+              const newPreviews = previews.slice(baseline);
+              const expectedVideos = kinds.filter(kind => kind.startsWith('video/')).length;
+              const expectedImages = kinds.filter(kind => kind.startsWith('image/')).length;
+              const loaded = newPreviews.every(e => {
                   const image = e.querySelector('gem-media-attachment img');
-                  return e.querySelector('gem-media-attachment .time-overlay') &&
-                    image && image.complete && image.naturalWidth > 0;
+                  return image && image.complete && image.naturalWidth > 0;
                 });
-              const busy = elements.some(e => e.matches('[role="progressbar"], mat-progress-spinner, mat-spinner, [aria-busy="true"], .gem-attachment-content.loading'));
+              const videos = newPreviews.filter(e => e.querySelector('gem-media-attachment .time-overlay')).length;
+              const images = newPreviews.length - videos;
+              const mediaReady = previews.length - baseline === names.length && loaded &&
+                videos === expectedVideos && images === expectedImages;
+              const busy = elements.some(e => e.matches('[role="progressbar"], mat-progress-spinner, mat-spinner, [aria-busy="true"], .gem-attachment-content.loading, .loading'));
               const error = elements.filter(e => e.matches('[role="alert"]')).map(e => e.textContent.trim()).join(' ');
-              return {ready: (attached || newVideos) && !busy && !error, error};
-            }''', dict(names=names,
-                       videos=all((mimetypes.guess_type(str(path))[0] or '').startswith('video/') for path in paths),
+              return {ready: mediaReady && !busy && !error, error, previewCount: previews.length,
+                      newCount: newPreviews.length, busy};
+                }''', dict(names=names,
+                       kinds=kinds,
                        baseline=getattr(self, '_upload_preview_baseline', 0)))
+            except Exception:
+                if self._check_for_external_submission():
+                    return
+                raise
             if state['error']:
+                if self._check_for_external_submission():
+                    return
                 raise GeminiError('Gemini 附件上传报错：' + state['error'])
+            now=time.monotonic()
+            if now >= next_status:
+                categories={}
+                for kind in kinds:
+                    category='视频' if kind.startswith('video/') else '图片' if kind.startswith('image/') else '其他'
+                    categories[category]=categories.get(category,0)+1
+                summary='、'.join(f'{category}{count}个' for category,count in categories.items())
+                print(f"[Gemini] 上传仍在等待：{summary}；新预览{state['newCount']}/{len(paths)}，可见预览总数{state['previewCount']}，忙碌={state['busy']}",flush=True)
+                next_status=now+10
             if state['ready']:
                 if ready_since is None:
                     ready_since = time.monotonic()
@@ -324,6 +356,9 @@ class GeminiWeb:
           const root = editor.closest('[data-node-type="input-area"], fieldset, form');
           return root ? [...root.querySelectorAll('uploader-file-preview')].filter(e => e.getClientRects().length).length : 0;
         }''')
+        if self._upload_preview_baseline:
+            self._submission_attempted=True
+            raise GeminiSubmissionUncertain('Gemini 输入区已有未识别附件；为避免重复提交或误发旧素材，已保留草稿并停止本次处理')
         openers = _selectors(self.sel.get('open_upload')) or _UPLOAD_OPENERS
         deadline = time.monotonic() + float(self.gcfg.get('upload_control_timeout_seconds', 30))
         ok = False
@@ -401,10 +436,80 @@ class GeminiWeb:
                     texts=[self._clean_response(loc.nth(i).inner_text(timeout=3000)) for i in range(loc.count())]
                     selected=selector;break
             except Exception:continue
-        try:users=self.page.locator('user-query, [data-message-author-role="user"]').count()
-        except Exception:users=0
-        return dict(model_count=len(texts),user_count=users,selector=selected,
+        try:
+            user_loc=self.page.locator('user-query, [data-message-author-role="user"]')
+            users=user_loc.count()
+            user_texts=[]
+            user_attachment_counts=[]
+            for i in range(users):
+                turn=user_loc.nth(i)
+                user_attachment_counts.append(turn.locator('user-query-file-preview').count())
+                lines=turn.locator('.query-text .query-text-line, query-text .query-text-line')
+                if lines.count():
+                    user_texts.append('\n'.join(lines.nth(j).inner_text(timeout=2000)
+                                                 for j in range(lines.count())))
+                else:
+                    body=turn.locator('.query-text, query-text')
+                    user_texts.append(body.first.evaluate('''e => {
+                      const copy=e.cloneNode(true);
+                      copy.querySelectorAll('.screen-reader-user-query-label, h5, button, [role="button"], mat-card, gem-media-attachment').forEach(n=>n.remove());
+                      return (copy.innerText || copy.textContent || '').trim();
+                    }''') if body.count() else turn.inner_text(timeout=2000))
+        except Exception:
+            users=0;user_texts=None;user_attachment_counts=None
+        return dict(model_count=len(texts),user_count=users,user_texts=user_texts,
+                    user_attachment_counts=user_attachment_counts,selector=selected,
                     texts=texts,response_hashes=[hashlib.sha256(t.encode('utf-8')).hexdigest() for t in texts])
+
+    @staticmethod
+    def _normalized_prompt(text):
+        return ' '.join((text or '').split())
+
+    def _draft_text(self):
+        try:
+            selector=_combine(self.sel.get('prompt_editor')) or _PROMPT_EDITOR
+            editor=self.page.locator(selector).filter(visible=True).first
+            return editor.evaluate("e => e.isContentEditable ? e.innerText : e.value || e.textContent || ''")
+        except Exception:
+            return ''
+
+    def _check_for_external_submission(self):
+        """Adopt the one matching user turn; stop if a send may have happened ambiguously."""
+        if self._sent_baseline is None or not self._expected_prompt:
+            return False
+        snapshot=self._response_snapshot()
+        if snapshot.get('user_texts') is None:
+            self._submission_attempted=True
+            raise GeminiSubmissionUncertain('无法读取 Gemini 用户消息以确认提交状态；已停止发送和自动重试')
+        delta=max(0,snapshot['user_count']-self._sent_baseline['user_count'])
+        if delta:
+            baseline_texts=self._sent_baseline.get('user_texts',[])
+            current_texts=snapshot.get('user_texts')
+            if baseline_texts is None or current_texts is None:
+                self._submission_attempted=True
+                raise GeminiSubmissionUncertain('无法读取 Gemini 会话中的用户消息以核对提交内容；已停止自动重试')
+            new_texts=current_texts[len(baseline_texts):]
+            expected=self._normalized_prompt(self._expected_prompt)
+            matches=[text for text in new_texts if self._normalized_prompt(text)==expected]
+            self._submission_attempted=True
+            if delta==1 and len(new_texts)==1 and len(matches)==1:
+                if self._expected_attachment_count:
+                    counts=snapshot.get('user_attachment_counts')
+                    if (counts is None or len(counts)!=snapshot['user_count']
+                            or counts[-1]!=self._expected_attachment_count):
+                        raise GeminiSubmissionUncertain('已发现匹配的手动消息，但无法确认包含本次全部附件；已停止发送和自动重试')
+                self._external_submission_accepted=True
+                print('[Gemini] 检测到提示词已由用户提交，接管本次回复并停止重复发送',flush=True)
+                return True
+            raise GeminiSubmissionUncertain('Gemini 对话出现新的用户消息，但无法唯一匹配当前提示词；已停止发送和自动重试')
+        draft=self._normalized_prompt(self._draft_text())
+        if draft and draft != self._normalized_prompt(self._expected_prompt):
+            self._submission_attempted=True
+            raise GeminiSubmissionUncertain('Gemini 草稿在等待期间发生变化，无法确认是否已手动提交；已停止重复发送和自动重试')
+        if not draft:
+            self._submission_attempted=True
+            raise GeminiSubmissionUncertain('Gemini 草稿已消失但对话中尚无可匹配消息；提交状态不确定，已停止自动重试')
+        return False
 
     def _last_response_text(self):
         snapshot=self._response_snapshot()
@@ -435,12 +540,20 @@ class GeminiWeb:
         return ''
 
     def send_prompt(self,text):
-        self._sent_baseline=self._response_snapshot()
-        self.type_prompt(text)
+        if self._check_for_external_submission():
+            return
+        if self._sent_baseline is None:
+            self._sent_baseline=self._response_snapshot()
+        if self._normalized_prompt(self._draft_text()) != self._normalized_prompt(text):
+            self.type_prompt(text)
+        if self._check_for_external_submission():
+            return
         sent=False
         buttons=_selectors(self.sel.get('send_button')) or _SEND_BUTTONS
         ready_deadline=time.monotonic()+float(self.gcfg.get('send_ready_timeout_seconds',180))
         while time.monotonic()<ready_deadline:
+            if self._check_for_external_submission():
+                return
             for selector in buttons:
                 try:
                     matches=self.page.locator(selector)
@@ -448,6 +561,8 @@ class GeminiWeb:
                         button=matches.nth(index)
                         if not button.is_visible():continue
                         if not button.is_enabled():continue
+                        if self._check_for_external_submission():
+                            return
                         # A click timeout can happen after the request was accepted.
                         # Attempt once, then confirm via the conversation instead of resending.
                         sent=True
@@ -460,6 +575,8 @@ class GeminiWeb:
             if sent:break
             self.page.wait_for_timeout(500)
         else:
+            if self._check_for_external_submission():
+                return
             self._capture_diagnostic('send_not_ready',error='Send control missing or disabled after upload/draft')
             raise GeminiError('上传或发送按钮迟迟未就绪；未用回车绕过缺失或禁用按钮，已保存诊断')
         # A successful click is not proof that Gemini accepted the request.
@@ -530,12 +647,25 @@ class GeminiWeb:
                        '脚本独立完整，禁止省略、同上、合并或缩写为15秒。')
         self._sent_baseline=None;self._last_observed_response=''
         self._submission_attempted=False
+        self._external_submission_accepted=False
+        self._expected_prompt=message_text
+        self._expected_attachment_count=len(video_paths or [])
         try:
             self.open()
+            self._sent_baseline=self._response_snapshot()
             self.type_prompt(message_text)
             print('[Gemini] 提示词草稿已填写，附件就绪前不会发送', flush=True)
-            if video_paths:self.upload_files(video_paths)
-            self.send_prompt(message_text)
+            if video_paths:
+                try:
+                    self.upload_files(video_paths)
+                except Exception:
+                    # The editor can be detached by a manual submission at the same
+                    # moment an upload wait times out. Reconcile the conversation
+                    # before letting the caller classify this as retryable.
+                    if not self._check_for_external_submission():
+                        raise
+            if not self._external_submission_accepted:
+                self.send_prompt(message_text)
             response=self.wait_response()
             self._last_observed_response=response
             if requested_count is not None:

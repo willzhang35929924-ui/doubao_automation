@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 from playwright.sync_api import sync_playwright
 
-from doubao_automation.gemini_web import GeminiError, GeminiWeb
+from doubao_automation.gemini_web import GeminiError, GeminiSubmissionUncertain, GeminiWeb
 from doubao_automation.paths import use_workspace_temp
 
 
@@ -47,8 +47,17 @@ class GeminiUploadTests(unittest.TestCase):
                               '</div><script>' + script + '</script>')
 
     def media_input(self, onchange=None):
-        onchange = onchange or "document.querySelector('#attachments').textContent=this.files[0].name"
+        onchange = onchange or self._render_previews_script()
         return '<input id="media" type="file" multiple accept="image/*,video/*" onchange="' + onchange + '">'
+
+    @staticmethod
+    def _render_previews_script():
+        return ("const root=document.querySelector('#attachments');root.innerHTML='';"
+            "for(const f of this.files){const v=f.type.startsWith('video/');"
+            "root.insertAdjacentHTML('beforeend',`<uploader-file-preview title=${f.name} style=display:block><gem-media-attachment>"
+            "<img src='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=='>"
+            "<span class=gem-attachment-content>${v?'<div class=time-overlay>0:15</div>':''}</span>"
+            "</gem-media-attachment></uploader-file-preview>`)}")
 
     def test_empty_config_waits_for_delayed_opener_and_chooses_media_input(self):
         markup = ('<button aria-label="上传和工具" onclick="document.querySelector(\'#menu\').hidden=false"></button>'
@@ -57,7 +66,7 @@ class GeminiUploadTests(unittest.TestCase):
         self.fixture('<div id="controls"></div><span id="attachments"></span>',
                      'setTimeout(()=>document.querySelector("#controls").innerHTML=' + json.dumps(markup) + ',200)')
         self.agent.upload_files([self.video])
-        self.assertEqual(self.page.locator('#attachments').inner_text(), self.video.name)
+        self.assertEqual(self.page.locator('uploader-file-preview').get_attribute('title'), self.video.name)
         self.assertEqual(self.page.locator('input[accept=".pdf,.txt"]').evaluate('(e)=>e.files.length'), 0)
         self.assertEqual(self.page.locator('#media').evaluate('(e)=>e.files.length'), 1)
         self.assertEqual(self.page.locator('user-query').count(), 0)
@@ -74,24 +83,59 @@ class GeminiUploadTests(unittest.TestCase):
                      'document.querySelector("#custom-upload").addEventListener("click",()=>{'
                      'if (!document.querySelector("#media")) {'
                      'const input=document.createElement("input");input.type="file";input.id="media";'
-                     'input.accept="video/*";input.onchange=()=>document.querySelector("#attachments").textContent=input.files[0].name;'
+                     'input.accept="video/*";input.onchange=()=>document.querySelector("#attachments").innerHTML=' +
+                     json.dumps(self._video_preview(self.video.name)) + ';'
                      'document.querySelector("[data-node-type]").append(input);input.click();}} ,true)')
         self.agent.upload_files([self.video])
-        self.assertEqual(self.page.locator('#attachments').inner_text(), self.video.name)
+        self.assertEqual(self.page.locator('uploader-file-preview').get_attribute('title'), self.video.name)
 
     def test_multiple_files_require_an_input_that_supports_multiple(self):
         other = Path(self.temp.name) / 'other.mp4'
         other.write_bytes(b'local fixture')
-        self.fixture('<input type="file" accept="video/*">' + self.media_input(
-            "document.querySelector('#attachments').innerHTML=Array.from(this.files).map(f=>'<span>'+f.name+'</span>').join('')") +
+        self.fixture('<input type="file" accept="video/*">' + self.media_input() +
             '<div id="attachments"></div>')
         self.agent.upload_files([self.video, other])
         self.assertEqual(self.page.locator('input').first.evaluate('(e)=>e.files.length'), 0)
         self.assertEqual(self.page.locator('#media').evaluate('(e)=>e.files.length'), 2)
 
+    @staticmethod
+    def _video_preview(name='clip.mp4'):
+        return (f'<uploader-file-preview title="{name}" style="display:block"><gem-media-attachment>'
+                '<img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==">'
+                '<span class="gem-attachment-content"><div class="time-overlay">0:15</div></span>'
+                '</gem-media-attachment></uploader-file-preview>')
+
+    def test_mixed_six_images_and_one_video_require_each_loaded_preview(self):
+        files=[]
+        for index in range(6):
+            path=Path(self.temp.name)/f'image-{index}.webp';path.write_bytes(b'local fixture');files.append(path)
+        video=Path(self.temp.name)/'clip.mp4';video.write_bytes(b'local fixture');files.append(video)
+        self.fixture(self.media_input()+'<div id="attachments"></div>')
+        self.agent.upload_files(files)
+        self.assertEqual(self.page.locator('uploader-file-preview').count(),7)
+        self.assertEqual(self.page.locator('.time-overlay').count(),1)
+
+    def test_mixed_media_missing_preview_does_not_pass(self):
+        self.cfg['gemini']['upload_timeout_seconds']=.2
+        image=Path(self.temp.name)/'still.webp';image.write_bytes(b'fixture')
+        video=Path(self.temp.name)/'clip.mp4';video.write_bytes(b'fixture')
+        self.fixture(self.media_input("document.querySelector('#attachments').innerHTML=window.tile")+'<div id="attachments"></div>')
+        self.page.evaluate('(tile)=>window.tile=tile',self._video_preview())
+        with self.assertRaisesRegex(GeminiError,'未在时限内确认'):
+            self.agent.upload_files([image,video])
+
+    def test_mixed_media_busy_or_alert_never_passes(self):
+        self.cfg['gemini']['upload_timeout_seconds']=.2
+        image=Path(self.temp.name)/'still.webp';image.write_bytes(b'fixture')
+        video=Path(self.temp.name)/'clip.mp4';video.write_bytes(b'fixture')
+        for marker in ('<div role="progressbar"></div>','<div role="alert">upload rejected</div>'):
+            with self.subTest(marker=marker):
+                self.fixture(self.media_input()+'<div id="attachments"></div>'+marker)
+                with self.assertRaises(GeminiError):self.agent.upload_files([image,video])
+
     def test_progress_must_finish_even_when_filename_is_already_visible(self):
         self.fixture(self.media_input(
-            "document.querySelector('#attachments').textContent=this.files[0].name;"
+            self._render_previews_script() + ";"
             "document.querySelector('#progress').hidden=false;"
             "setTimeout(()=>{document.querySelector('#progress').hidden=true;window.finished=true},700)") +
             '<span id="attachments"></span><div id="progress" role="progressbar" hidden>Uploading</div>')
@@ -120,8 +164,9 @@ class GeminiUploadTests(unittest.TestCase):
     def test_existing_nameless_video_tile_is_not_proof_of_new_upload(self):
         self.cfg['gemini']['upload_timeout_seconds'] = .2
         self.fixture(self.media_input('void 0') + self.nameless_video_tile())
-        with self.assertRaisesRegex(GeminiError, '未在时限内确认'):
+        with self.assertRaisesRegex(GeminiSubmissionUncertain, '已有未识别附件'):
             self.agent.upload_files([self.video])
+        self.assertEqual(self.page.locator('input').evaluate('(e)=>e.files.length'), 0)
 
     def test_nameless_video_tile_count_must_cover_all_new_files(self):
         self.cfg['gemini']['upload_timeout_seconds'] = .2
@@ -173,6 +218,45 @@ class GeminiUploadTests(unittest.TestCase):
         self.fixture()
         with self.assertRaisesRegex(GeminiError, '文件不存在'):
             self.agent.upload_files([Path(self.temp.name) / 'missing.mp4'])
+
+    def manual_submission_fixture(self, attachment_count):
+        self.fixture(self.media_input("setTimeout(()=>window.manualSubmit(),100)") +
+            '<div id="attachments"></div><button aria-label="发送" '
+            'onclick="window.autoSendCount=(window.autoSendCount||0)+1">Send</button>',
+            '''window.manualSubmit=()=>{
+              const editor=document.querySelector('[contenteditable]');
+              const turn=document.createElement('user-query');
+              const query=document.createElement('div');query.className='query-text';
+              const label=document.createElement('h5');label.className='screen-reader-user-query-label';
+              label.textContent='你说 shortened prompt';query.append(label);
+              const line=document.createElement('p');line.className='query-text-line';
+              line.textContent=editor.innerText;query.append(line);turn.append(query);
+              for(let i=0;i<''' + str(attachment_count) + ''';i++){
+                const preview=document.createElement('user-query-file-preview');
+                preview.textContent='0:15';turn.append(preview);
+              }
+              editor.innerText='';document.querySelector('#attachments').replaceChildren();
+              document.body.append(turn);
+              const answer=document.createElement('model-response');
+              answer.textContent='fresh manual reply';document.body.append(answer);
+            };''')
+
+    def test_manual_send_during_upload_uses_real_class_selector_and_never_resends(self):
+        self.manual_submission_fixture(1)
+        self.agent.open=lambda:None
+        self.cfg['gemini']['response_stable_seconds']=0
+        self.assertEqual(self.agent.generate([self.video], 'fixture instruction'), 'fresh manual reply')
+        self.assertEqual(self.page.locator('user-query').count(),1)
+        self.assertFalse(self.page.evaluate('Boolean(window.autoSendCount)'))
+        self.assertTrue(self.agent._external_submission_accepted)
+
+    def test_matching_manual_prompt_missing_attachment_stops_without_resend(self):
+        self.manual_submission_fixture(0)
+        self.agent.open=lambda:None
+        with self.assertRaisesRegex(GeminiSubmissionUncertain,'全部附件'):
+            self.agent.generate([self.video], 'fixture instruction')
+        self.assertEqual(self.page.locator('user-query').count(),1)
+        self.assertFalse(self.page.evaluate('Boolean(window.autoSendCount)'))
 
     def test_current_chinese_send_label_and_visible_editor_are_used_once(self):
         self.fixture('<button aria-label="发送" onclick="this.dataset.clicks=Number(this.dataset.clicks||0)+1;'
