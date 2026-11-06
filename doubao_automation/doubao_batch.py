@@ -11,6 +11,26 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 
+_CHAT_RECHECK_IDLE_SECONDS = 180
+_CHAT_RECHECK_LIMIT = 3
+_CHAT_RECHECK_NAV_TIMEOUT_SECONDS = 10
+
+
+def formal_doubao_chat_path(url):
+    """Return the numeric path of an official HTTPS chat, or an empty string."""
+    if not isinstance(url, str):
+        return ''
+    try:
+        parsed = urlsplit(url)
+        if (parsed.scheme == 'https' and parsed.hostname in ('www.doubao.com', 'doubao.com')
+                and parsed.port in (None, 443) and parsed.username is None and parsed.password is None
+                and re.fullmatch(r'/chat/[0-9]+/?', parsed.path)):
+            return parsed.path
+    except ValueError:
+        pass
+    return ''
+
+
 def quota_exhaustion_matches(text, patterns):
     # Ambiguous login, verification, network or system failures require review.
     if re.search(r'网络|连接|超时|系统错误|验证码|验证|登录|未登录|network|connection|timed?\s*out|system\s+error|captcha|verif(?:y|ication)|log\s*in|sign\s*in', text or '', re.IGNORECASE):
@@ -387,11 +407,18 @@ class BatchGenerationMixin:
                             chat_path:location.pathname, latest_reply:''};
           if (!routeReady) return {...empty, ...metadata};
           const allowed = (ownership.control_texts || []).map(norm);
+          const latestControl = allowed.at(-1);
+          metadata.latest_control_mounted = !latestControl || anchorKind === 'verified_control';
+          metadata.later_user_turn = false;
           const received=[]; let latestOwned=null;
           for (const node of messages.slice(anchorIndex + 1)) {
             if (user(node)) {
               const text=norm(node.querySelector('[data-testid="message_text_content"]')?.innerText || node.innerText);
-              if (!allowed.some(value => value && text === value)) break;
+              if (!allowed.some(value => value && text === value)) {
+                metadata.later_user_turn = true;
+                break;
+              }
+              if (text === latestControl) metadata.latest_control_mounted = true;
             } else received.push(node);
             latestOwned=node;
           }
@@ -536,13 +563,45 @@ class BatchGenerationMixin:
             pass
         return False
 
+    def _batch_modal_visible(self):
+        """A read-only recheck must leave a pending dialog for the user."""
+        try:
+            return bool(self._approval_dialog_kind() or self._visible_dialogs())
+        except Exception:
+            return True
+
+    def _can_recheck_original_chat(self, chat_url, baseline, scope):
+        chat_path = formal_doubao_chat_path(chat_url)
+        ownership = self._batch_ownership
+        if (not chat_path or self.page.url != chat_url or baseline.get('ownership_acknowledged') is not True
+                or not scope or not scope.get('owner_found') or not scope.get('route_ready')
+                or scope.get('chat_path') != chat_path or ownership.get('chat_path') != chat_path
+                or scope.get('later_user_turn')):
+            return False
+        try:
+            if ownership.get('original_anchor_proof') != self._original_anchor_proof(ownership, chat_path):
+                return False
+            selectors = getattr(self, 'sel', {}).get('input_box') or '[contenteditable="true"], textarea, [role="textbox"]'
+            if not isinstance(selectors, str):
+                selectors = ', '.join(selectors)
+            has_draft = self.page.evaluate('''selector => [...document.querySelectorAll(selector)].some(editor => {
+              if (!editor.getClientRects().length || getComputedStyle(editor).visibility === 'hidden') return false;
+              return Boolean(String(editor.value ?? editor.innerText ?? editor.textContent ?? '')
+                .replace(/[\\u200b\\ufeff]/g, '').trim());
+            })''', selectors)
+            return not has_draft and not self._batch_modal_visible() and self.page.url == chat_url
+        except Exception:
+            return False
+
     def run_batch(self, tasks, image_paths, dests, context, on_submitted, on_generated):
         """One request, up to two separately billed assets; resume_only never sends text."""
+        resume = bool(context.get('resume_only'))
         result = {'videos': {}, 'remote_refs': dict(context.get('remote_refs') or {}),
-                  'unresolved': [t['id'] for t in tasks], 'submitted': False,
+                  'unresolved': [t['id'] for t in tasks], 'submitted': resume,
                   'chat_url': context.get('chat_url', ''), 'error_kind': '', 'error': '',
                   'continuation_safe': False, 'quota_remaining': None}
-        resume = bool(context.get('resume_only'))
+        recovery_timeout = context.get('recovery_timeout_seconds') if resume else None
+        short_recovery = recovery_timeout not in (None, '')
         baseline = dict(context.get('baseline') or {})
         self._batch_scope_state = None
         self._batch_send_started_fresh = False
@@ -558,18 +617,32 @@ class BatchGenerationMixin:
         remote_started = False
         last_url, last_reply_identity = result['chat_url'], ''
         try:
+            timeout = float(self.dcfg.get('generation_timeout_minutes', 25)) * 60
+            deadline = None
             if resume:
                 target = context.get('chat_url', '')
                 parsed = urlsplit(target)
-                result['submitted'] = True
                 if (parsed.hostname not in ('www.doubao.com', 'doubao.com')
                         or not re.fullmatch(r'/chat/\d+/?', parsed.path)):
                     result.update(error_kind='needs_user', error='原请求缺少正式数字ID的豆包对话地址（临时 local_ 路由不可恢复）；请核对原会话正式地址，已保留请求，禁止重复发送')
                     return result
-                self.page.goto(target, wait_until='domcontentloaded')
-                self.page.wait_for_timeout(3000)
+                if short_recovery:
+                    if not formal_doubao_chat_path(target):
+                        result.update(error_kind='needs_user', error='短回查需要可信的 HTTPS 豆包原会话地址')
+                        return result
+                    seconds = float(recovery_timeout)
+                    if not 0 < seconds < float('inf') or not timeout > 0:
+                        raise ValueError('原会话短回查等待秒数必须是正的有限值')
+                    timeout = min(timeout, seconds)
+                    deadline = time.monotonic() + timeout
+                    self.page.goto(target, wait_until='domcontentloaded', timeout=max(1, int(timeout * 1000)))
+                    if urlsplit(self.page.url)[:3] != parsed[:3]:
+                        result.update(error_kind='needs_user', error='短回查跳转到其他地址，已保留原会话等待核对')
+                        return result
+                else:
+                    self.page.goto(target, wait_until='domcontentloaded')
+                    self.page.wait_for_timeout(3000)
                 self._assert_logged_in()
-                result['submitted'] = True
             else:
                 self.open_chat()
                 target = context.get('chat_url', '')
@@ -616,13 +689,30 @@ class BatchGenerationMixin:
                 self._save_batch_debug(context)
             self._batch_body_before = baseline.get('body', '')
             baseline_keys = set(baseline.get('keys', []))
-            timeout = float(self.dcfg.get('generation_timeout_minutes', 25)) * 60
             ack_timeout = max(0, float(self.dcfg.get('ownership_ack_timeout_seconds', 180)))
             ownership_wait_started = None
-            deadline, last_log = time.monotonic() + timeout, 0
+            deadline = deadline if deadline is not None else time.monotonic() + timeout
+            last_log, rechecks = 0, 0
+            progress = len(known), 0
+            next_recheck = time.monotonic() + _CHAT_RECHECK_IDLE_SECONDS
+            poll_interval = max(.001, float(self.dcfg.get('poll_interval_seconds', 5)))
+
+            def wait_for_poll(limit=float('inf')):
+                seconds = min(poll_interval, limit, deadline - time.monotonic())
+                if seconds > 0:
+                    self.page.wait_for_timeout(max(1, int(seconds * 1000)))
+
             while time.monotonic() < deadline:
                 self._assert_logged_in()
-                self._handle_dialogs()
+                if short_recovery:
+                    if urlsplit(self.page.url)[:3] != parsed[:3]:
+                        result.update(error_kind='needs_user', error='短回查离开原会话，已保留原请求等待核对')
+                        return result
+                    if self._batch_modal_visible():
+                        result.update(error_kind='needs_user', error='原会话存在待处理弹窗或无法安全读取窗口，已停止只读回查')
+                        return result
+                else:
+                    self._handle_dialogs()
                 assets = self._batch_assets()
                 scope = getattr(self, '_batch_scope_state', None)
                 ownership_changed = False
@@ -653,7 +743,7 @@ class BatchGenerationMixin:
                             result.update(error_kind='needs_user', error=error, continuation_safe=False)
                             return result
                         remaining = ack_timeout - (now - ownership_wait_started)
-                        self.page.wait_for_timeout(max(1, int(min(float(self.dcfg.get('poll_interval_seconds',5)),remaining)*1000)))
+                        wait_for_poll(remaining)
                         continue
                     ownership_wait_started = None
                     if baseline.get('scope_version') != 1:
@@ -676,6 +766,7 @@ class BatchGenerationMixin:
                     if scope is not None:
                         if baseline.get('ownership_acknowledged') is not True:
                             print(f'[{self.name}] 平台已接受本次消息，等待视频生成…', flush=True)
+                            next_recheck = time.monotonic() + _CHAT_RECHECK_IDLE_SECONDS
                         baseline['ownership_acknowledged'] = True
                     on_submitted(last_url, baseline)
                     result['chat_url'] = last_url
@@ -686,7 +777,7 @@ class BatchGenerationMixin:
                             if c['status']=='failed' and 0<=c['card_position']-card_offset<len(original_ids)]
                 failed_ids=[tid for tid in failed_ids if any(t['id']==tid for t in tasks)]
                 if resume and not assets and not cards and scope is None:
-                    self.page.wait_for_timeout(int(float(self.dcfg.get('poll_interval_seconds',5))*1000))
+                    wait_for_poll()
                     continue
                 by_key = {self._key_asset(a): a for a in assets}
                 if resume and baseline_keys:
@@ -695,7 +786,7 @@ class BatchGenerationMixin:
                     if len(assets)<n:
                         # Chat history can mount one lazy card at a time.  An
                         # incomplete prefix is not evidence of changed assets.
-                        self.page.wait_for_timeout(int(float(self.dcfg.get('poll_interval_seconds',5))*1000))
+                        wait_for_poll()
                         continue
                     prefix = assets[:n]
                     keys_match = len(prefix)==n and {self._key_asset(a) for a in prefix}==baseline_keys
@@ -755,14 +846,24 @@ class BatchGenerationMixin:
                             result['videos'][tid] = str(destination)
                             print(f'[{self.name}] 分段已下载 {task["seg_index"]+1}/{task["seg_total"]}: {destination.name}', flush=True)
                     if ref.get('kind')=='card' and ref.get('url'):
+                        if (short_recovery or rechecks) and self._batch_modal_visible():
+                            continue
                         try:self.page.keyboard.press('Escape')
                         except Exception:pass
                 result['unresolved'] = [t['id'] for t in tasks if t['id'] not in result['videos']]
                 if not result['unresolved']:
                     result['continuation_safe'] = True
                     return result
+                current_progress = len(known), len(result['videos'])
+                if current_progress != progress:
+                    progress = current_progress
+                    next_recheck = time.monotonic() + _CHAT_RECHECK_IDLE_SECONDS * 2 ** rechecks
+                # A reloaded history can briefly show an assistant response
+                # older than the control already sent. Wait for that user turn
+                # before interpreting another confirmation or quota response.
+                controls_current = not (rechecks or short_recovery) or bool(scope and scope.get('latest_control_mounted'))
                 reply = self._assistant_text()
-                if reply==baseline.get('assistant_before'):
+                if not controls_current or reply==baseline.get('assistant_before'):
                     reply=''
                 action = choose_reply(reply)
                 active = any(k in reply for k in ('正在生成', '生成中', '排队中', '预计等待', '生成任务已提交'))
@@ -810,7 +911,9 @@ class BatchGenerationMixin:
                         last_reply_identity = reply_identity
                         self.type_and_send(clarification)
                         self._batch_sent_prompt = clarification
-                if (not resume and one_at_time and result['videos'] and len(known) < len(tasks) and not active):
+                        next_recheck = time.monotonic() + _CHAT_RECHECK_IDLE_SECONDS * 2 ** rechecks
+                if (controls_current and not resume and one_at_time and result['videos']
+                        and len(known) < len(tasks) and not active):
                     next_task = next(t for t in tasks if t['id'] not in known)
                     if next_task['id'] not in single_followups:
                         single_followups.add(next_task['id'])
@@ -823,7 +926,8 @@ class BatchGenerationMixin:
                         on_submitted(self.page.url,baseline)
                         self.type_and_send(followup)
                         deadline = time.monotonic() + timeout
-                if not any(k in reply for k in ('正在生成', '生成中', '排队', '预计等待')):
+                        next_recheck = time.monotonic() + _CHAT_RECHECK_IDLE_SECONDS * 2 ** rechecks
+                if controls_current and not any(k in reply for k in ('正在生成', '生成中', '排队', '预计等待')):
                     if (not action and not active and getattr(self,'_last_reply_source','')=='latest_assistant'
                             and quota_exhaustion_matches(reply, self.quota_patterns)):
                         self._save_batch_debug(context,reply)
@@ -838,7 +942,24 @@ class BatchGenerationMixin:
                     last_log = time.monotonic()
                     print(f'[{self.name}] 本批已取回{len(result["videos"])}/{len(tasks)}条，继续等待未完成分段', flush=True)
                     self._save_batch_debug(context,reply)
-                self.page.wait_for_timeout(int(float(self.dcfg.get('poll_interval_seconds', 5)) * 1000))
+                if (not short_recovery and rechecks < _CHAT_RECHECK_LIMIT and time.monotonic() >= next_recheck
+                        and not action and not failed_ids and all(tid not in known for tid in result['unresolved'])
+                        and self._can_recheck_original_chat(result['chat_url'], baseline, scope)):
+                    remaining_ms = int(min(_CHAT_RECHECK_NAV_TIMEOUT_SECONDS, deadline - time.monotonic()) * 1000)
+                    if remaining_ms > 0:
+                        target = result['chat_url']
+                        rechecks += 1
+                        print(f'[{self.name}] 长时间未见新产物，重读已确认的原会话（{rechecks}/{_CHAT_RECHECK_LIMIT}）', flush=True)
+                        try:
+                            self.page.goto(target, wait_until='domcontentloaded', timeout=remaining_ms)
+                        except Exception:
+                            print(f'[{self.name}] 原会话重读未完成，继续在原等待窗口内核对', flush=True)
+                        next_recheck = time.monotonic() + _CHAT_RECHECK_IDLE_SECONDS * 2 ** rechecks
+                        if urlsplit(self.page.url)[:3] != urlsplit(target)[:3]:
+                            result.update(error_kind='needs_user', error='重读后对话地址与原请求不同，已保留原请求等待核对')
+                            return result
+                        continue
+                wait_for_poll()
             result.update(error_kind='download' if known else 'timeout', error='请求结果尚未完全取回，已保存原对话，禁止盲目重发')
             return result
         except Exception as exc:

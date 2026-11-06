@@ -14,7 +14,7 @@ from .account_manager import AccountManager
 from .browser_pool import BrowserSession
 from .config import get, require_doubao_accounts
 from .doubao_agent import DoubaoAgent, GenerationFailed, NeedsLogin, NeedsUserAction, QuotaExhausted
-from .doubao_batch import verified_download_matches
+from .doubao_batch import BatchGenerationMixin, formal_doubao_chat_path, verified_download_matches
 from .feishu_client import FeishuClient, FeishuError
 from .gemini_web import (GeminiError, GeminiNotLoggedIn, GeminiResponseRejected,
                          GeminiSubmissionUncertain, GeminiWeb, is_refusal_response)
@@ -558,12 +558,66 @@ class Pipeline:
             else:
                 with self.store.txn() as data:data['assemblies'][sid].update(status='done',error='')
 
-    def _execute_batch(self,agent,account,tasks):
-        rid=tasks[0]['request_id'];ids=[t['id'] for t in tasks]
-        self._attempted_requests.add(rid)
-        request=self.store.snapshot()['requests'][rid]
+    def _late_result_tasks(self, account, rid, request, ledger):
+        """Check that both journals still bind a timed-out batch to the accepted turn."""
+        if (not isinstance(request, dict) or not isinstance(ledger, dict)
+                or rid not in self._attempted_requests or account not in self.account_names
+                or request.get('request_id') != rid or request.get('account') != account
+                or request.get('phase') != 'unknown' or request.get('error_kind') not in ('timeout', 'download')
+                or request.get('submitted') is not True or ledger.get('submitted') is not True
+                or ledger.get('request_id') != rid):
+            return []
+        chat_url = request.get('chat_url', '')
+        chat_path = formal_doubao_chat_path(chat_url)
+        baseline = request.get('baseline')
+        if (not chat_path or ledger.get('chat_url') != chat_url or not isinstance(baseline, dict)
+                or baseline != ledger.get('baseline') or baseline.get('scope_version') != 1
+                or baseline.get('ownership_acknowledged') is not True):
+            return []
+        ownership = baseline.get('ownership')
+        if (not isinstance(ownership, dict) or ownership.get('chat_path') != chat_path
+                or ownership.get('marker') != f'【自动化任务标记：{rid}】'):
+            return []
+        try:
+            original_proof = BatchGenerationMixin._original_anchor_proof(ownership, chat_path)
+        except ValueError:
+            return []
+        if ownership.get('original_anchor_proof') != original_proof:
+            return []
+        entries = ledger.get('entries', {})
+        active_ids = [tid for tid in ledger.get('task_ids', [])
+                      if entries.get(tid, {}).get('state') not in ('cancelled', 'rejected')]
+        if (not active_ids or request.get('task_ids') != active_ids
+                or any(entries.get(tid, {}).get('state') not in ('submitted', 'unknown', 'charged')
+                       for tid in active_ids)):
+            return []
+        tasks = self._request_tasks(request)
+        if (len(tasks) != len(active_ids) or not any(t['status'] != 'done' for t in tasks)
+                or any(t.get('account') != account for t in tasks)):
+            return []
+        return tasks
+
+    def _execute_batch(self, agent, account, tasks, *, recovery_timeout_seconds=None):
+        rid = tasks[0]['request_id']
+        recovering = recovery_timeout_seconds is not None
+        requests = self.store.snapshot().get('requests', {})
+        request = requests.get(rid, {}) if recovering else requests[rid]
         ledger=self.accounts.request(account,rid)
-        submitted=bool(ledger.get('submitted') or request.get('submitted'))
+        if recovering:
+            # A short recovery has no route into an unsent reservation, even
+            # if a journal or account changes after candidate selection.
+            eligible = self._late_result_tasks(account, rid, request, ledger)
+            if (not eligible or [t['id'] for t in eligible] != [t['id'] for t in tasks]
+                    or self.accounts.status(account).get('status') not in ('available', 'busy')
+                    or not isinstance(recovery_timeout_seconds, (int, float))
+                    or not 0 < recovery_timeout_seconds <= 60):
+                print(f'[{account}] 原会话绑定发生变化，跳过本轮短时回查。', flush=True)
+                return False
+            tasks = eligible
+        recovery_path = formal_doubao_chat_path(request['chat_url']) if recovering else ''
+        ids = [t['id'] for t in tasks]
+        self._attempted_requests.add(rid)
+        submitted=bool(recovering or ledger.get('submitted') or request.get('submitted'))
         script=next((s for s in self.store.snapshot().get('scripts',[]) if s['id']==tasks[0]['script_id']),{})
         if not submitted and is_refusal_response(script.get('text','')):
             self.accounts.release_unsubmitted(account,rid)
@@ -581,6 +635,8 @@ class Pipeline:
                      task_ids=ids,original_task_ids=list(request.get('original_task_ids') or ledger.get('task_ids') or ids),
                      remote_refs={t['id']:t['remote_ref'] for t in tasks
                                                if _valid_remote_ref(t.get('remote_ref'))},resume_only=submitted)
+        if recovering:
+            context['recovery_timeout_seconds'] = recovery_timeout_seconds
         dests={t['id']:VIDEOS_DIR/f"{t['script_id']}_seg{t['seg_index']}.raw.mp4" for t in tasks}
 
         def on_quota_remaining(count):
@@ -591,9 +647,14 @@ class Pipeline:
                 if q['used']+q['reserved']+q['unknown']>q['limit']:
                     raise GenerationFailed('平台余额少于本批次，请先释放预留再缩小批次')
 
-        context['on_quota_remaining']=on_quota_remaining
+        if not recovering:
+            context['on_quota_remaining']=on_quota_remaining
 
         def on_submitted(chat_url,baseline):
+            if recovering:
+                if formal_doubao_chat_path(chat_url) != recovery_path:
+                    raise ValueError('短时回查期间原会话地址改变')
+                return  # The existing binding already records this submission.
             self.accounts.mark_submitted(account,rid,chat_url=chat_url,baseline=baseline)
             with self.store.txn() as data:
                 data['requests'][rid].update(phase='submitted',submitted=True,chat_url=chat_url,baseline=baseline)
@@ -614,7 +675,9 @@ class Pipeline:
             result=dict(videos={},remote_refs={},unresolved=ids,submitted=self.accounts.request(account,rid).get('submitted',False),
                         chat_url=context['chat_url'],error_kind=kind,error=str(exc),continuation_safe=False)
         if not isinstance(result,dict):raise RuntimeError('生成程序未返回批次结果')
-        if isinstance(result.get('quota_remaining'),int):
+        if recovering and formal_doubao_chat_path(result.get('chat_url')) != recovery_path:
+            return False
+        if not recovering and isinstance(result.get('quota_remaining'),int):
             # Observation after submission is accounting-only; it cannot cancel an accepted request.
             self.accounts.observe_remaining(account,result['quota_remaining'])
         for tid,ref in result.get('remote_refs',{}).items():
@@ -634,10 +697,11 @@ class Pipeline:
         current={t['id']:t for t in self.store.snapshot()['tasks']}
         unresolved=[tid for tid in ids if current[tid]['status']!='done']
         ledger=self.accounts.request(account,rid)
-        submitted=bool(result.get('submitted') or ledger.get('submitted'))
+        submitted=bool(recovering or result.get('submitted') or ledger.get('submitted'))
         error=str(result.get('error') or '')[:500];kind=result.get('error_kind','')
         with self.store.txn() as data:
-            data['requests'][rid].update(chat_url=result.get('chat_url') or data['requests'][rid].get('chat_url',''),
+            saved_url = request['chat_url'] if recovering else result.get('chat_url') or data['requests'][rid].get('chat_url','')
+            data['requests'][rid].update(chat_url=saved_url,
                                         continuation_safe=bool(result.get('continuation_safe')),error_kind=kind,error=error)
         if not unresolved:
             with self.store.txn() as data:
@@ -645,7 +709,7 @@ class Pipeline:
                 saved['phase']='refunded' if saved.get('refunded_task_ids') else 'complete'
             self._assemble_all()
             return True
-        if kind=='user_approval':
+        if not recovering and kind=='user_approval':
             evidence=result.get('approval_block')
             with self.store.txn() as data:
                 data['requests'][rid]['approval_block']=evidence if isinstance(evidence,dict) else {}
@@ -665,7 +729,7 @@ class Pipeline:
                             task.update(status='needs_user',failure_phase='before_accept',error=error)
                 return False
         refunded=[]
-        if submitted and kind=='partial_failed_refunded' and result.get('continuation_safe') is True:
+        if not recovering and submitted and kind=='partial_failed_refunded' and result.get('continuation_safe') is True:
             # A failed slot remains its original slot; never infer it from the number/order of successes.
             try:
                 rejected=result.get('rejected_task_ids')
@@ -693,7 +757,7 @@ class Pipeline:
                 with self.store.txn() as data:data['requests'][rid]['phase']='refunded'
                 self._assemble_all()
                 return True
-        if submitted and kind=='quota' and result.get('continuation_safe') is True:
+        if not recovering and submitted and kind=='quota' and result.get('continuation_safe') is True:
             # This is a definitive refusal, not a timeout or an uncertain accepted request.
             evidence=dict(kind='quota',definitive=True,active=False,source='latest_assistant')
             released=self.accounts.release_rejected(account,rid,unresolved,evidence)
@@ -735,7 +799,7 @@ class Pipeline:
                         task.update(status='pending',request_id='',account='',attempts=cloud,cloud_attempts=cloud,
                                     local_attempts=int(task.get('local_attempts',0))+1,local_blocked=blocked,
                                     failure_phase='before_submit',error=error)
-        if kind=='quota':self.accounts.mark_exhausted(account,error)
+        if kind=='quota' and not recovering:self.accounts.mark_exhausted(account,error)
         elif kind=='login':self.accounts.mark_needs_login(account,error)
         return ((bool(refunded) and not self.accounts.quota(account)['unknown'])
                 or (not submitted and kind not in ('quota','login')))
@@ -813,6 +877,34 @@ class Pipeline:
         with self._run_lock():
             return self._stage_run_locked()
 
+    def _recover_late_results(self):
+        """Give each eligible request one readback after the normal account pass."""
+        accounts = {acct['name']: acct for acct in get(self.cfg, 'accounts.doubao', []) or []
+                    if acct.get('enabled', True)}
+        requests = self.store.snapshot().get('requests', {})
+        for rid, request in requests.items():
+            account = request.get('account')
+            if (rid not in self._attempted_requests or account not in accounts
+                    or self.accounts.status(account).get('status') != 'available'):
+                continue
+            ledger = self.accounts.request(account, rid)
+            tasks = self._late_result_tasks(account, rid, request, ledger)
+            if not tasks or not self.accounts.mark_busy(account):
+                continue
+            session = None
+            try:
+                session = BrowserSession(account, accounts[account]['profile'], self.cfg)
+                session.start()
+                agent = DoubaoAgent(session, self.cfg, account)
+                print(f'[{account}] 本轮收尾短时回查原会话，检查已提交的视频。', flush=True)
+                self._execute_batch(agent, account, tasks, recovery_timeout_seconds=45)
+            except Exception as exc:
+                print(f'[{account}] 原会话回查未完成（{type(exc).__name__}）。', flush=True)
+            finally:
+                if session is not None:
+                    session.stop()
+                self.accounts.release(account)
+
     def _stage_run_locked(self):
         self._attempted_requests=set()
         self._local_attempts_this_run={};self._local_blocked_tasks=set()
@@ -823,6 +915,7 @@ class Pipeline:
         for acct in get(self.cfg,'accounts.doubao',[]) or []:
             if acct.get('enabled',True):self._worker(acct)
             if self._all_finished():break
+        self._recover_late_results()
         self._assemble_all()
         self.report()
         done,running,pending,failed,total=self._progress()
@@ -849,6 +942,8 @@ class Pipeline:
             print('\n提示: 存在等待平台授权或核对的原请求；预留与提交记录已保留，不会自动重新发送。')
         elif any(t.get('failure_phase')=='invalid_script' for t in snap.get('tasks',[])):
             print('\n提示: Gemini 拒答不能作为视频剧本；请先取得有效剧本，程序不会提交这份拒答。')
+        elif any(t['status']=='awaiting_result' for t in snap.get('tasks',[])):
+            print('\n已提交的任务仍在等待视频结果或下载。再次运行会从原会话恢复检查。')
         elif pending or failed:
             print("\n提示: 待执行任务会在账号额度恢复（次日）或重新登录后，重跑 python run_pipeline.py run 自动续接。")
 
