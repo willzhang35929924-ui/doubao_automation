@@ -1,6 +1,6 @@
 let data, accounts = [], dirty = false;
 const accountPending = new Map(), accountFeedback = new Map();
-const openingLoginAccounts = new Set();
+const openingLoginAccounts = new Set(), openingAccountWindows = new Set();
 let accountFetchSequence = 0, accountMarkup = '', accountAddPending = false;
 const videoFolderFeedback = new Map(), videoApprovalErrors = new Map(), videoApprovalPending = new Set(), videoApprovalJobs = new Map();
 const videoDeleteFeedback = new Map(), videoDeletePending = new Set();
@@ -147,13 +147,26 @@ async function previewClearHistory() {
 }
 async function deleteRow(target) { const id = typeof target === 'string' ? target : target.dataset.recordId; if (!confirm('从当前工作台移除此记录？飞书记录会在下次同步时恢复。')) return; try { msg(await api('/api/rows/delete',{record_id:id})); dirty=false; await refresh(); } catch(e) { msg(e.message); } }
 const accountLabels = {available:'已登录，可运行', busy:'运行中', checking:'正在验证登录', needs_login:'待登录', exhausted:'今日额度耗尽', disabled:'不可用', opening:'正在打开浏览器', error:'浏览器启动失败'};
+const accountWindowLabels = {opening:'正在打开账号窗口…', open:'账号窗口已打开', error:'账号窗口启动失败，请重试并查看启动日志'};
 async function loadAccounts() {
   const sequence = ++accountFetchSequence;
   const result = await api('/api/accounts');
   if (sequence !== accountFetchSequence) return;
   refreshRecovered('账号');
+  const priorWindows = new Map(accounts.filter(a => a.account_window_open).map(a => [a.name,a.account_window_status]));
   accounts = result.accounts || [];
   for (const a of accounts) {
+    const status = a.account_window_status;
+    const finishedOpening = openingAccountWindows.has(a.name) && status !== 'opening';
+    const windowEnded = priorWindows.has(a.name) && !accountPending.has(a.name) && status !== 'opening'
+      && (!a.account_window_open || (status === 'error' && priorWindows.get(a.name) !== 'error'));
+    if (finishedOpening || windowEnded) {
+      openingAccountWindows.delete(a.name);
+      const previous = accountFeedback.get(a.name);
+      const message = a.account_window_note || accountWindowLabels[status] || '账号窗口已关闭';
+      accountFeedback.set(a.name,message);
+      if (finishedOpening || document.querySelector('#log').textContent === previous) msg(message);
+    }
     if (!openingLoginAccounts.has(a.name)) continue;
     let message;
     if (!a.login_window_open && a.status === 'error') message = '登录窗口启动失败：'+(a.note || '请重试并查看启动日志');
@@ -177,7 +190,16 @@ function renderAccounts() {
     else if (a.status === 'available' && q?.remaining === 0) label = '已登录，今日次数已用完';
     const quota = q ? `<p class="account-quota"><strong>今日已使用 ${q.used}/${q.limit}</strong> · 今日剩余 ${q.remaining} 次 · 预留 ${q.reserved} · 结果未知 ${q.unknown}</p><p class="muted">${esc(q.date || '')} · 按北京时间每日重置 · ${q.estimated === false ? '已按平台显示校准（非实时）' : '本地估算，平台余额待核验'}${q.remaining === 0 ? ' · 剩余为0，后续任务自动跳过' : ''}${q.unknown ? ' · 结果未知的次数暂占余额' : ''}${q.blocked_reason ? ' · '+esc(q.blocked_reason) : ''}</p>` : '<p class="muted account-quota">每日次数统计暂不可用</p>';
     const login = a.login_window_open ? `<p class="muted">登录窗口：${esc(a.login_note || accountLabels[a.login_status] || '等待登录验证')}</p>` : '';
-    return `<article class="row"><b>${esc(a.name)}</b> · 配置已保存 · ${esc(label)}<p class="muted">${esc(a.note || '')}</p>${quota}${login}<div class="actions"><button class="btn gray" data-name="${esc(a.name)}" onclick="openAccount(this)"${pending || a.login_window_open ? ' disabled' : ''}>打开登录窗口</button><button class="btn gray" data-name="${esc(a.name)}" onclick="confirmAccount(this)"${pending ? ' disabled' : ''}>检查登录状态</button><button class="btn gray" data-name="${esc(a.name)}" onclick="closeAccount(this)"${pending ? ' disabled' : ''}>关闭登录窗口</button><button class="btn red" data-name="${esc(a.name)}" onclick="deleteAccount(this)"${pending ? ' disabled' : ''}>永久删除</button></div><p class="muted account-result" role="status">${esc(pending || accountFeedback.get(a.name) || '')}</p></article>`;
+    const name = esc(a.name), openingWindow = a.account_window_status === 'opening';
+    const accountWindow = a.account_window_open || openingWindow;
+    const feedback = pending || accountFeedback.get(a.name) || a.account_window_note || accountWindowLabels[a.account_window_status] || '';
+    return `<article class="row"><b>${name}</b> · 配置已保存 · ${esc(label)}<p class="muted">${esc(a.note || '')}</p>${quota}${login}<div class="actions">
+      <button class="btn gray" data-name="${name}" onclick="openAccount(this)"${pending || a.login_window_open || accountWindow ? ' disabled' : ''}>打开登录窗口</button>
+      <button class="btn gray" data-name="${name}" onclick="visitAccount(this)"${pending || a.login_window_open || openingWindow ? ' disabled' : ''}>打开账号</button>
+      <button class="btn gray" data-name="${name}" onclick="confirmAccount(this)"${pending ? ' disabled' : ''}>检查登录状态</button>
+      <button class="btn gray" data-name="${name}" onclick="closeAccount(this)"${pending ? ' disabled' : ''}>${accountWindow ? '关闭账号窗口' : '关闭登录窗口'}</button>
+      <button class="btn red" data-name="${name}" onclick="deleteAccount(this)"${pending ? ' disabled' : ''}>永久删除</button>
+      </div><p class="muted account-result" role="status">${esc(feedback)}</p></article>`;
   }).join('') || '暂无豆包账号';
   if (markup !== accountMarkup) {
     document.querySelector('#accountRows').innerHTML = markup;
@@ -202,27 +224,34 @@ async function addAccount() {
   finally { accountAddPending = false; if (button) button.disabled = false; }
 }
 function accountName(target) { return typeof target === 'string' ? target : target.dataset.name; }
-async function accountAction(target, action, pendingText) {
+async function accountAction(target, action, pendingText, fallbackMessage) {
   const name = accountName(target);
   if (accountPending.has(name)) return;
   accountPending.set(name,pendingText); accountFeedback.delete(name); ++accountFetchSequence; renderAccounts();
   try {
     const result = await api('/api/accounts/'+action,{name});
     if (action === 'open' && result.status === 'opening') openingLoginAccounts.add(name);
-    const message = result.message || (action === 'open' ? '登录窗口已打开，请完成登录并等待自动验证' : action === 'close' ? '登录窗口已关闭' : action === 'delete' ? '账号配置已删除' : '账号状态已检查');
+    if (action === 'visit' && result.status === 'opening') openingAccountWindows.add(name);
+    if (action === 'close' || action === 'delete') openingAccountWindows.delete(name);
+    const message = result.message || (action === 'visit' ? accountWindowLabels[result.status] : '') || fallbackMessage;
     accountFeedback.set(name,message); msg(message);
     if (action === 'delete') { accounts = accounts.filter(a => a.name !== name); accountFeedback.delete(name); }
     await loadAccounts();
   } catch(e) { accountFeedback.set(name,e.message); msg(e.message); }
   finally { ++accountFetchSequence; accountPending.delete(name); renderAccounts(); }
 }
-async function openAccount(target) { await accountAction(target,'open','正在打开登录窗口…'); }
-async function confirmAccount(target) { await accountAction(target,'confirm','正在检查登录状态…'); }
-async function closeAccount(target) { await accountAction(target,'close','正在关闭登录窗口…'); }
+async function openAccount(target) { await accountAction(target,'open','正在打开登录窗口…','登录窗口已打开，请完成登录并等待自动验证'); }
+async function visitAccount(target) { await accountAction(target,'visit','正在打开账号窗口…','账号窗口已打开'); }
+async function confirmAccount(target) { await accountAction(target,'confirm','正在检查登录状态…','账号状态已检查'); }
+async function closeAccount(target) {
+  const account = accounts.find(a => a.name === accountName(target));
+  const windowLabel = account?.account_window_open || account?.account_window_status === 'opening' ? '账号窗口' : '登录窗口';
+  await accountAction(target,'close',`正在关闭${windowLabel}…`,`${windowLabel}已关闭`);
+}
 async function deleteAccount(target) {
   const name = accountName(target);
   if (accountPending.has(name) || !confirm('永久删除账号 '+name+' 的磁盘配置？此操作无法撤销。')) return;
-  await accountAction(target,'delete','正在删除账号配置…');
+  await accountAction(target,'delete','正在删除账号配置…','账号配置已删除');
 }
 async function loadVideos() {
   const sequence = ++videoFetchSequence;

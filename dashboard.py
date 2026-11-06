@@ -62,7 +62,7 @@ def enforce_local_request():
         return jsonify(error='不允许跨站读取安全令牌', code='origin_invalid'), 403
     if (os.environ.get('DOUBAO_CONTAINER_PREVIEW') == '1'
             and request.method not in ('GET', 'HEAD')
-            and request.path in {'/api/run', '/api/accounts/add', '/api/accounts/open',
+            and request.path in {'/api/run', '/api/accounts/add', '/api/accounts/open', '/api/accounts/visit',
                                  '/api/open-video', '/api/videos/approve'}):
         return jsonify(error='容器预览版不支持启动浏览器、桌面操作或视频后处理',
                        code='container_unsupported'), 501
@@ -161,6 +161,10 @@ def require_idle():
     if running():
         raise ValueError('流水线正在运行，请先停止再修改素材或账号')
 
+def account_windows_open():
+    with lock:
+        return any(job['thread'].is_alive() for job in pending_accounts.values())
+
 @app.errorhandler(ValueError)
 def bad_value(exc):
     return jsonify(error=str(exc)), 400
@@ -216,7 +220,7 @@ def state():
                 log = f.read().decode('utf-8', errors='replace')
     return jsonify(server_pid=os.getpid(), project_root=str(ROOT), data_root=str(DATA_ROOT),
                    service_pid=int(os.environ.get('DOUBAO_DASHBOARD_SERVICE_PID','0')) or None,
-                   login_windows_open=any(job['thread'].is_alive() for job in pending_accounts.values()),
+                   login_windows_open=account_windows_open(),
                    postprocessing=readonly_postprocess_busy(),
                    running=running(),
                     can_resume=has_unfinished_plan(d),resume_script_count=planned_script_count(d),resume_run_id=d.get('run_id',''),
@@ -373,8 +377,8 @@ def run():
     with lock:
         if running():
             return jsonify(error='流水线已在运行'),409
-        if any(job['thread'].is_alive() for job in pending_accounts.values()):
-            raise ValueError('账号登录窗口仍在使用，请完成登录或关闭登录窗口后再运行')
+        if account_windows_open():
+            raise ValueError('账号窗口仍在使用，请关闭账号或登录窗口后再运行')
         require_doubao_accounts(load_config())
         runner=Pipeline.__new__(Pipeline); runner.store=store()
         try:
@@ -472,7 +476,12 @@ def account_list():
         out=[]
         for a in items:
             name=a['name']; state=manager.status(name); job=pending_accounts.get(name,{})
-            opened=bool(job.get('thread') and job['thread'].is_alive())
+            alive=bool(job.get('thread') and job['thread'].is_alive())
+            visiting=job.get('mode')=='visit'
+            opened=alive and not visiting
+            visit_status=job.get('status','') if visiting else ''
+            if visit_status=='closed':
+                visit_status=''
             if opened and state.get('status') in ('error','needs_login'):
                 state=dict(state,status='opening' if job.get('status')=='opening' else 'needs_login',
                            note=job.get('note','正在打开登录窗口'))
@@ -480,16 +489,24 @@ def account_list():
                             status=state.get('status','needs_login'),note=state.get('note','尚未验证登录'),
                             quota=account_quota(manager,name,state),login_window_open=opened,
                             login_status=job.get('status','opening') if opened else '',
-                            login_note=job.get('note','等待登录验证') if opened else ''))
+                            login_note=job.get('note','等待登录验证') if opened else '',
+                            account_window_open=visiting and alive,
+                            account_window_status=visit_status,
+                            account_window_note=job.get('note','') if visit_status else ''))
     return jsonify(accounts=out)
+
+def visible_account_browser_config():
+    cfg=copy.deepcopy(load_config())
+    cfg['browser']=dict(cfg.get('browser') or {},headless=False)
+    return cfg
+
 
 def login_worker(name,profile,job):
     from doubao_automation.browser_pool import BrowserSession
     sess=None
     try:
-        use_workspace_temp(); cfg=copy.deepcopy(load_config())
-        # Login always needs a visible window, even when generation is headless.
-        cfg['browser']=dict(cfg.get('browser') or {},headless=False)
+        use_workspace_temp()
+        cfg=visible_account_browser_config()
         sess=BrowserSession(name,profile,cfg,start_url='https://www.doubao.com/chat/').start()
         job.update(status='needs_login',note='请在独立浏览器内手动登录；检测成功后自动保存并关闭窗口')
         job['ready'].set()
@@ -533,15 +550,80 @@ def login_worker(name,profile,job):
             sess.stop()
         job['ready'].set(); job['finished'].set()
 
-def start_login(name,profile):
-    old=pending_accounts.get(name)
-    if old and old['thread'].is_alive():
-        return old
-    job={'stop':threading.Event(),'ready':threading.Event(),'finished':threading.Event(),
+def active_account_window(name, profile_path):
+    """Find the job owning this name or persistent profile. Caller holds lock."""
+    return next((job for owner,job in pending_accounts.items()
+                 if job['thread'].is_alive() and
+                 (owner==name or job.get('profile_path')==profile_path)),None)
+
+
+def start_account_window(name, profile, profile_path, mode, worker):
+    job={'mode':mode,'profile_path':profile_path,'stop':threading.Event(),
+         'ready':threading.Event(),'finished':threading.Event(),'focus':threading.Event(),
          'status':'opening','note':'正在打开独立浏览器'}
-    job['thread']=threading.Thread(target=login_worker,args=(name,profile,job),daemon=True)
+    job['thread']=threading.Thread(target=worker,args=(name,profile,job),daemon=True)
     pending_accounts[name]=job; job['thread'].start()
     return job
+
+
+def start_login(name,profile):
+    profile_path=resolve(profile).resolve()
+    old=active_account_window(name,profile_path)
+    if old:
+        if old is pending_accounts.get(name) and old.get('mode','login')=='login':
+            return old
+        raise ValueError('此浏览器资料已有窗口，请关闭后再打开登录窗口')
+    return start_account_window(name,profile,profile_path,'login',login_worker)
+
+
+def account_window_worker(name,profile,job):
+    """Own the visible browse window without running login verification."""
+    from doubao_automation.browser_pool import BrowserSession
+    sess=None
+    try:
+        use_workspace_temp()
+        cfg=visible_account_browser_config()
+        sess=BrowserSession(name,profile,cfg)
+        sess.start()
+        response=sess.page.goto('https://www.doubao.com/chat/',wait_until='domcontentloaded')
+        if response is not None and response.status>=400:
+            raise RuntimeError(f'HTTP {response.status}')
+        job.update(status='open',note='账号窗口已打开')
+        job['ready'].set()
+        while not job['stop'].is_set():
+            pages=session_pages(sess)
+            if not pages:
+                break
+            if sess.page.is_closed():
+                sess.page=pages[0]
+            try:
+                if job['focus'].is_set():
+                    job['focus'].clear()
+                    sess.page.bring_to_front()
+                sess.page.wait_for_timeout(300)
+            except Exception:
+                if not sess.page.is_closed():
+                    raise
+        job.update(status='closed',note='')
+    except Exception as exc:
+        logfile=LOGS_DIR/'account_browser.log'
+        reason=('此账号的浏览器资料正在使用，请关闭已有窗口后再试'
+                if '账号浏览器配置正在使用' in str(exc)
+                else '账号窗口打开失败，请检查浏览器和网络')
+        message=f'{reason}。日志 {logfile}'
+        job.update(error=message,status='error',note=message)
+        try:
+            LOGS_DIR.mkdir(parents=True,exist_ok=True)
+            with logfile.open('a',encoding='utf-8') as handle:
+                handle.write(f'{time.strftime("%Y-%m-%d %H:%M:%S")} [{name}] {type(exc).__name__} {reason}\n')
+        except OSError:
+            pass
+    finally:
+        if sess:
+            sess.stop()
+        job['finished'].set()
+        job['ready'].set()
+
 
 
 def login_start_response(name,profile,job):
@@ -582,6 +664,41 @@ def account_open():
         job=start_login(name,a['profile'])
     return login_start_response(name,a['profile'],job)
 
+
+@app.post('/api/accounts/visit')
+def account_visit():
+    body=request.get_json()
+    name=body.get('name') if isinstance(body,dict) else None
+    if not isinstance(name,str) or not name:
+        raise ValueError('请选择要打开的账号')
+    with lock:
+        require_idle()
+        acct=next((a for a in load_config().get('accounts',{}).get('doubao',[]) if a['name']==name),None)
+        if not acct:
+            return jsonify(error='账号不存在'),404
+        profile=acct['profile']
+        profile_path=resolve(profile).resolve()
+        if PROFILES.resolve() not in profile_path.parents:
+            raise ValueError('账号浏览器资料必须位于本机 profiles 目录')
+        job=active_account_window(name,profile_path)
+        if job:
+            if (job is not pending_accounts.get(name) or job.get('mode')!='visit'
+                    or job.get('profile_path')!=profile_path or job['stop'].is_set()):
+                return jsonify(error='此浏览器资料已有窗口或正在关闭，请关闭后再试'),409
+            job['focus'].set()
+        else:
+            if not profile_path.is_dir():
+                return jsonify(error='账号浏览器资料不存在，请先打开登录窗口'),409
+            job=start_account_window(name,profile,profile_path,'visit',account_window_worker)
+    ready=job['ready'].wait(8)
+    if job.get('error'):
+        return jsonify(error=job['error'],code='browser_start_failed',name=name,status='error'),503
+    if job['finished'].is_set() or job.get('status')=='closed':
+        return jsonify(error='账号窗口已关闭，请重新打开',name=name),409
+    if ready:
+        return jsonify(ok=True,name=name,status='open',message='账号窗口已打开')
+    return jsonify(ok=True,name=name,status='opening',message='账号窗口正在启动'),202
+
 @app.post('/api/accounts/confirm')
 def confirm():
     name=request.get_json(force=True).get('name')
@@ -606,11 +723,16 @@ def confirm():
 @app.post('/api/accounts/close')
 def account_close():
     name=request.get_json(force=True).get('name')
-    job=pending_accounts.get(name)
-    if job and job['thread'].is_alive():
-        job['stop'].set()
-        if not job['finished'].wait(15):
-            return jsonify(error='登录窗口仍在关闭，请稍后重试'),409
+    with lock:
+        job=pending_accounts.get(name)
+        if job and job['thread'].is_alive():
+            job['stop'].set()
+        else:
+            job=None
+    if job and not job['finished'].wait(15):
+        return jsonify(error='账号窗口仍在关闭，请稍后重试'),409
+    if job and job.get('mode')=='visit':
+        return jsonify(ok=True,name=name,message='账号窗口已关闭')
     return jsonify(ok=True,name=name)
 
 @app.post('/api/accounts/delete')
@@ -623,10 +745,11 @@ def account_delete():
         p=resolve(a['profile']).resolve()
         if PROFILES.resolve() not in p.parents:
             raise ValueError('invalid profile path')
-        job=pending_accounts.get(name)
-        if job and job['thread'].is_alive():
-            job['stop'].set()
-            return jsonify(error='正在关闭登录窗口，请稍后重试删除'),409
+        job=active_account_window(name,p)
+        if job:
+            if job is pending_accounts.get(name):
+                job['stop'].set()
+            return jsonify(error='账号浏览器资料正在使用，请关闭对应窗口后重试删除'),409
         if p.exists(): shutil.rmtree(p)
         cfg=load_config();cfg['accounts']['doubao']=[x for x in cfg['accounts']['doubao'] if x['name']!=name]; _savecfg(cfg)
         with JsonStore(STATE_DIR/'accounts.json').txn() as d:
