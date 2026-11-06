@@ -21,6 +21,8 @@ from doubao_automation.account_manager import AccountManager
 from doubao_automation.orchestrator import Pipeline
 from doubao_automation.config import DEFAULT_CONFIG_PATH, load_config, require_doubao_accounts, save_config
 from doubao_automation.doubao_login import probe_doubao_login, session_pages
+from doubao_automation.caption_context import (caption_source, caption_images, caption_videos, caption_target,
+                                               caption_entry, row_captions, put_caption)
 from doubao_automation.feishu_client import FeishuClient
 from doubao_automation.windows_shell import open_video_folder
 from doubao_automation import postprocess
@@ -63,6 +65,7 @@ def enforce_local_request():
     if (os.environ.get('DOUBAO_CONTAINER_PREVIEW') == '1'
             and request.method not in ('GET', 'HEAD')
             and request.path in {'/api/run', '/api/accounts/add', '/api/accounts/open', '/api/accounts/visit',
+                                 '/api/captions/generate',
                                  '/api/open-video', '/api/videos/approve'}):
         return jsonify(error='容器预览版不支持启动浏览器、桌面操作或视频后处理',
                        code='container_unsupported'), 501
@@ -79,6 +82,7 @@ def protect_response(response):
 lock = threading.RLock()
 proc = None
 pending_accounts = {}
+caption_model_lock = threading.Lock()
 
 # HTML is inserted here by the migration script.
 HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>豆包 Studio</title><style>*{box-sizing:border-box}body{margin:0;background:#f5f5f7;color:#1d1d1f;font:15px -apple-system,BlinkMacSystemFont,"SF Pro Display",system-ui}.shell{max-width:1160px;margin:auto;padding:28px 22px}header{display:flex;align-items:center;gap:24px;margin-bottom:24px}.logo{font-size:24px;font-weight:750}.nav{display:flex;gap:6px;background:#e9e9ed;padding:5px;border-radius:14px}.nav button{background:transparent;color:#515154;padding:9px 16px;border:0;cursor:pointer}.nav button.active{background:white;box-shadow:0 1px 5px #0002}.status{margin-left:auto;background:#e8f8ee;color:#168044;border-radius:99px;padding:8px 13px;font-size:13px}.card{background:#fff;border:1px solid #e8e8ed;border-radius:20px;padding:22px;margin:14px 0;box-shadow:0 3px 12px #00000008}h1{font-size:28px;margin:0 0 6px}h2{font-size:18px;margin:0 0 14px}.muted{color:#777;font-size:13px}.btn{border:0;border-radius:12px;padding:11px 17px;font-weight:650;background:#007aff;color:white;cursor:pointer}.btn.gray{background:#e9e9ed;color:#222}.btn.red{background:#fff0f0;color:#c22}.actions{display:flex;gap:9px;flex-wrap:wrap}.row{padding:16px;border:1px solid #e8e8ed;border-radius:16px;margin:12px 0}.grid{display:grid;grid-template-columns:220px 1fr;gap:12px}input,textarea{font:inherit;padding:11px;border:1px solid #d2d2d7;border-radius:11px;width:100%;background:white}textarea{min-height:110px}.thumbs{display:flex;gap:8px;overflow:auto;margin:8px 0}.thumbs img{width:90px;height:75px;object-fit:cover;border-radius:10px}.log{white-space:pre-wrap;background:#17171a;color:#eee;border-radius:14px;padding:14px;max-height:190px;overflow:auto}@media(max-width:700px){.grid{grid-template-columns:1fr}header{flex-wrap:wrap}}</style></head><body><main class="shell"><header><div class="logo">豆包 Studio</div><nav class="nav"><button id="navstudio" class="active" onclick="tab('studio')">工作台</button><button id="navaccounts" onclick="tab('accounts')">账号库</button><button id="navvideos" onclick="tab('videos')">已下载视频</button></nav><span class="status" id="status">● 连接中</span></header><section id="studio"><h1>视频自动化工作台</h1><p class="muted">飞书同步、Gemini脚本与豆包视频生成</p><article class="card"><h2>运行控制</h2><div class="actions"><button class="btn" onclick="syncFeishu()">同步飞书</button><span id="sync-result" role="status" aria-live="polite"></span><button class="btn gray" onclick="saveRows()">保存修改</button><button class="btn" onclick="run()">开启运行</button><button class="btn red" onclick="stop()">停止</button></div></article><article class="card"><h2>手动添加素材</h2><div class="grid"><label>keyword<input id="newkw"></label><label>提示词<textarea id="newprompt"></textarea></label><label>视频<input id="newvid" type="file" accept="video/*" multiple></label><label>产品图<input id="newimg" type="file" accept="image/*" multiple></label></div><button class="btn" onclick="upload()">添加素材</button></article><article class="card"><h2>提示词与视频记录</h2><div id="rows"></div></article></section><section id="accounts" style="display:none"><h1>豆包账号库</h1><article class="card"><div id="accountRows"></div><button class="btn" onclick="addAccount()">＋ 添加豆包账号</button></article></section><section id="videos" style="display:none"><h1>已下载视频</h1><div id="videoRows"></div></section><article class="card"><h2>操作消息</h2><pre class="log" id="log">就绪</pre></article><article class="card"><h2>运行日志</h2><pre class="log" id="runlog">暂无运行日志</pre></article></main><script src="/dashboard.js"></script></body></html>'''
@@ -161,6 +165,15 @@ def require_idle():
     if running():
         raise ValueError('流水线正在运行，请先停止再修改素材或账号')
 
+
+class CaptionConflict(Exception):
+    pass
+
+
+@app.errorhandler(CaptionConflict)
+def caption_conflict(exc):
+    return jsonify(error=str(exc)), 409
+
 def account_windows_open():
     with lock:
         return any(job['thread'].is_alive() for job in pending_accounts.values())
@@ -230,7 +243,10 @@ def state():
                    unavailable_hidden_sources=len(hidden_ids-restorable_hidden),
                    rows=[{'record_id':s.get('record_id',''), 'keyword':s.get('keyword',''),
                           'prompt':s.get('prompt_text',''), 'videos':s.get('videos',[]),
-                          'images':images_by_keyword.get(s.get('keyword',''),[])} for s in sources])
+                          'images':images_by_keyword.get(s.get('keyword',''),[]),
+                          'caption_images':caption_images(d,s),
+                          'caption_videos':caption_videos(s),
+                          'captions':row_captions(d,s)} for s in sources])
 
 
 def sync_report(stats,products,sources,visible,restored):
@@ -321,6 +337,137 @@ def edit():
                 d.update(scripts=[], tasks=[])
     return jsonify(ok=True, updated=updated)
 
+
+def _caption_request():
+    body=request.get_json(silent=True)
+    if not isinstance(body,dict):
+        raise ValueError('请求内容必须是 JSON 对象')
+    record_id=body.get('record_id')
+    kind=body.get('kind')
+    index=body.get('index')
+    role=body.get('role')
+    if (not isinstance(record_id,str) or not record_id.strip()
+            or kind not in ('images','video')
+            or (index is not None and (type(index) is not int or index<0))
+            or role not in ('product','reference')):
+        raise ValueError('素材记录、Caption 类型、下标或角色无效')
+    return body,record_id,kind,index,role
+
+
+def _caption_saved_source(snap,record_id):
+    if not any(s.get('record_id')==record_id for s in snap.get('sources',[])):
+        raise ValueError('素材记录不存在，请刷新工作台')
+    return caption_source(snap,record_id)
+
+
+def _caption_target_for(snap,record_id,kind,index,role):
+    source=_caption_saved_source(snap,record_id)
+    target=caption_target(snap,source,kind,index=index,role=role)
+    if not isinstance(target,dict) or not target.get('key') or not target.get('fingerprint'):
+        raise ValueError('无法确认 Caption 对应的素材')
+    paths=target.get('paths')
+    if not isinstance(paths,(list,tuple)) or not paths:
+        raise ValueError('Caption 素材为空')
+    root=(PRODUCTS_DIR if kind=='images' else SOURCES_DIR).resolve()
+    for raw in paths:
+        path=Path(raw).resolve()
+        if root not in path.parents or not path.is_file():
+            raise ValueError('Caption 素材已变化或不在保存的素材目录内')
+    return source,target
+
+
+def _caption_target_identity(target):
+    return (target.get('key'),target.get('fingerprint'),target.get('index'),
+            target.get('role'),target.get('kind'),
+            tuple(str(Path(path).resolve()) for path in target.get('paths',())))
+
+
+@app.post('/api/captions/generate')
+def caption_generate():
+    _,record_id,kind,index,role=_caption_request()
+    if not caption_model_lock.acquire(blocking=False):
+        return jsonify(error='另一条 Caption 正在生成，请等待完成'),409
+    try:
+        with lock:
+            require_idle()
+            snap=store().snapshot()
+            _,target=_caption_target_for(snap,record_id,kind,index,role)
+            old_entry=copy.deepcopy(caption_entry(snap,target))
+            target_id=_caption_target_identity(target)
+            paths=list(target['paths'])
+        from doubao_automation.caption_runtime import CaptionRuntimeError, generate_caption
+        try:
+            candidate=generate_caption(paths,kind,role)
+        except CaptionRuntimeError as exc:
+            return jsonify(error=str(exc),code='caption_runtime_unavailable'),503
+        except RuntimeError as exc:
+            app.logger.error('Caption 模型推理失败: %s', type(exc).__name__)
+            return jsonify(error='Caption 生成失败，请查看本机服务日志后重试'),502
+        if not isinstance(candidate,str) or not candidate.strip():
+            return jsonify(error='Caption 模型没有返回有效描述，请重试'),502
+        candidate=candidate.strip()
+        with lock:
+            require_idle()
+            current=store().snapshot()
+            _,current_target=_caption_target_for(current,record_id,kind,index,role)
+            if (_caption_target_identity(current_target)!=target_id
+                    or caption_entry(current,current_target)!=old_entry):
+                raise CaptionConflict('素材或 Caption 已被修改，请刷新后重试')
+            if old_entry and old_entry.get('edited') is True:
+                return jsonify(entry=old_entry,candidate_text=candidate,
+                               candidate_target={key:current_target[key] for key in ('index','role','fingerprint')})
+            with store().txn() as data:
+                _,commit_target=_caption_target_for(data,record_id,kind,index,role)
+                if (_caption_target_identity(commit_target)!=target_id
+                        or caption_entry(data,commit_target)!=old_entry):
+                    raise CaptionConflict('素材或 Caption 已被修改，请刷新后重试')
+                entry=put_caption(data,commit_target,candidate,enabled=True,edited=False)
+        return jsonify(entry=entry)
+    finally:
+        caption_model_lock.release()
+
+
+@app.post('/api/captions/save')
+def caption_save():
+    body,record_id,kind,index,role=_caption_request()
+    text=body.get('text')
+    enabled=body.get('enabled')
+    revision=body.get('revision')
+    fingerprint=body.get('fingerprint')
+    if (not isinstance(text,str) or len(text)>2000 or not isinstance(enabled,bool)
+            or not isinstance(fingerprint,str) or not fingerprint
+            or (revision is not None and (not isinstance(revision,str) or not revision))):
+        raise ValueError('Caption 内容、版本或启用状态无效')
+    if enabled and not text.strip():
+        raise ValueError('启用的 Caption 不能为空')
+    with lock:
+        require_idle()
+        with store().txn() as data:
+            _,target=_caption_target_for(data,record_id,kind,index,role)
+            current=caption_entry(data,target)
+            current_revision=current.get('revision') if isinstance(current,dict) else None
+            if fingerprint!=target['fingerprint'] or revision!=current_revision:
+                raise CaptionConflict('素材或 Caption 版本已变化，请刷新后重试')
+            entry=put_caption(data,target,text.strip(),enabled=enabled,edited=True)
+    return jsonify(entry=entry)
+
+
+@app.post('/api/captions/preview')
+def caption_preview():
+    body=request.get_json(silent=True)
+    record_id=body.get('record_id') if isinstance(body,dict) else None
+    if not isinstance(record_id,str) or not record_id.strip():
+        raise ValueError('请选择素材记录')
+    snap=store().snapshot()
+    source=_caption_saved_source(snap,record_id)
+    from doubao_automation.orchestrator import build_script_prompt
+    from doubao_automation.gemini_web import format_gemini_request
+    try:
+        prompt=build_script_prompt(load_config(),snap,source)
+    except RuntimeError as exc:
+        return jsonify(error=str(exc)),400
+    return jsonify(prompt=format_gemini_request(prompt)[0])
+
 @app.post('/api/rows/delete')
 def row_delete():
     rid=request.get_json(force=True).get('record_id')
@@ -377,6 +524,8 @@ def run():
     with lock:
         if running():
             return jsonify(error='流水线已在运行'),409
+        if caption_model_lock.locked():
+            return jsonify(error='本地素材识别正在进行，请完成后再开始运行'),409
         if account_windows_open():
             raise ValueError('账号窗口仍在使用，请关闭账号或登录窗口后再运行')
         require_doubao_accounts(load_config())

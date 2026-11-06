@@ -196,6 +196,28 @@ def _resolve_audit_dir(value):
         raise ValueError('macOS 诊断目录不能位于源码目录')
     return path
 
+def format_gemini_request(message):
+    from .caption_context import script_instruction
+
+    instruction = script_instruction(message)
+    count = _explicit_script_count(instruction)
+    targets = _requested_durations(instruction, count)
+    constraints = ''
+    if count is not None:
+        constraints += f'本次最终只输出{count}个脚本。'
+    if targets:
+        constraints += '本次各脚本总时长按顺序为' + '、'.join(f'{value}秒' for value in targets) + '。'
+    full = (message + '\n\n【自动化脚本输出规范】本次附加提示词优先于固定指令；发生冲突时忽略固定指令的旧数量和旧时长。'
+            + constraints +
+            '以下约束是本次最终要求，禁止额外输出其他数量或时长的版本。'
+            '严格保留本次指定的总时长，不因豆包单次15秒限制而压缩。'
+            '每个脚本使用独立标题Script 01：标题（总时长N秒），正文单列“总时长：N秒”。'
+            '时间轴从00:00开始连续覆盖到总时长，按每5秒一个时间块，最后不足5秒按实际写；'
+            '每块分别列摄影与构图、视觉与动作、照明与氛围、音频与口播。'
+            '脚本独立完整，禁止省略、同上、合并或缩写为15秒。')
+    return full, count, targets
+
+
 class GeminiWeb:
     def __init__(self, session, cfg: dict):
         self.session = session
@@ -807,21 +829,7 @@ class GeminiWeb:
                       and message_text==_refusal_context['original_message']))
         inputs=self._input_fingerprint(video_paths) if same_inputs else None
         self._last_refusal_context=None
-        requested_count=_explicit_script_count(message_text)
-        targets=_requested_durations(message_text,requested_count)
-        constraints=''
-        if requested_count is not None:
-            constraints+=f'本次最终只输出{requested_count}个脚本。'
-        if targets:
-            constraints+='本次各脚本总时长按顺序为'+ '、'.join(f'{value}秒' for value in targets)+'。'
-        message_text+=('\n\n【自动化脚本输出规范】本次附加提示词优先于固定指令；发生冲突时忽略固定指令的旧数量和旧时长。'
-                       +constraints+
-                       '以下约束是本次最终要求，禁止额外输出其他数量或时长的版本。'
-                       '严格保留本次指定的总时长，不因豆包单次15秒限制而压缩。'
-                       '每个脚本使用独立标题Script 01：标题（总时长N秒），正文单列“总时长：N秒”。'
-                       '时间轴从00:00开始连续覆盖到总时长，按每5秒一个时间块，最后不足5秒按实际写；'
-                       '每块分别列摄影与构图、视觉与动作、照明与氛围、音频与口播。'
-                       '脚本独立完整，禁止省略、同上、合并或缩写为15秒。')
+        message_text,requested_count,targets=format_gemini_request(message_text)
         self._sent_baseline=None;self._last_observed_response=''
         self._submission_attempted=False
         self._external_submission_accepted=False

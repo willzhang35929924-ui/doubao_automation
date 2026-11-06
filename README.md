@@ -67,6 +67,12 @@ Windows 双击 `start_dashboard.bat`；Mac 双击 `start_mac.command`。启动�
 
 Windows 桌面助手与 macOS Finder 操作是不同的平台路径：Windows 新启动入口可在默认数据目录下请求启动桌面助手；自定义数据目录时不会启动不匹配的助手。macOS 通过 Finder 请求显示文件，无法证明窗口已显示；两平台均需实机核验。
 
+### Mac 本地素材识别（可选）
+
+Apple 芯片、macOS 26 或更新版本及 arm64 Python 3.12 可运行 `./scripts/setup_caption_runtime.sh` 安装独立的 MLX 环境和 Qwen3-VL-4B-Instruct 4-bit 权重（约 3.1 GB）。安装需要联网，工作台识别使用本机模型。
+
+素材行的「一键识别图片」默认读取最多 6 张产品图，也可单选。「一键识别视频」对选定的视频抽取最多 6 帧，可选商品实拍或创意参考。描述可分别编辑和保存，视频描述可选是否带入。点击「预览最终提示词」查看飞书指令、有效描述和脚本规范。素材版本变化后，旧描述会标记为过期。
+
 ### 审核后自动去水印与超分
 
 **本发布副本不包含 video-subtitle-remover、RapidOCR、后处理适配器或模型权重**，因此审核后的去水印与 SeedVR2 超分功能尚不能运行；未经 PATH-only FFmpeg 验证的第三方适配器会被拒绝，补装模型本身无法启用。ComfyUI 需由使用者独立部署，节点、模型和 GPU 兼容性仍需验证。视频生成完成不代表审核后处理已完成，也不保证提示词所写的 4K/60fps 或无水印规格。

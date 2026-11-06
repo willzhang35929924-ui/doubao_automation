@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .account_manager import AccountManager
 from .browser_pool import BrowserSession
+from .caption_context import apply_caption_context
 from .config import get, require_doubao_accounts
 from .doubao_agent import DoubaoAgent, GenerationFailed, NeedsLogin, NeedsUserAction, QuotaExhausted
 from .doubao_batch import BatchGenerationMixin, formal_doubao_chat_path, verified_download_matches
@@ -41,6 +42,26 @@ def _uses_source_prompt_column(cfg):
             and int(fixed.get('record_index', -1)) < 0
             and bool(table) and table == str(source.get('table_id', '') or '').strip()
             and bool(field) and field == str(source.get('prompt_field', '提示词') or '').strip())
+
+
+def build_script_prompt(cfg, snapshot, source):
+    """Compile the exact per-record input used for preview and generation."""
+    extra = (source.get('prompt_text') or '').strip()
+    if _uses_source_prompt_column(cfg):
+        if not extra:
+            raise RuntimeError(f"源记录 {source.get('record_id')} 的提示词为空：固定指令配置指向素材表同一列，不能借用其他记录的提示词")
+        message = extra
+    else:
+        fixed = snapshot.get('fixed_prompt') or ''
+        if not fixed:
+            path = resolve(get(cfg, 'feishu.fixed_prompt.file', 'config/gemini_prompt.txt'))
+            fixed = path.read_text(encoding='utf-8').strip() if path.exists() else ''
+        if not fixed:
+            raise RuntimeError('固定提示词指令为空：请在 config.yaml 配置来源或写入 config/gemini_prompt.txt')
+        message = fixed
+        if extra and extra != fixed.strip():
+            message += '\n\n【本次附加提示词】\n' + extra
+    return apply_caption_context(message, snapshot, source)
 
 
 class Pipeline:
@@ -89,14 +110,6 @@ class Pipeline:
         sources = snap.get("sources") or []
         if not sources:
             raise RuntimeError("还没有源数据，请先执行: python run_pipeline.py fetch")
-        row_prompt = _uses_source_prompt_column(self.cfg)
-        fixed = "" if row_prompt else snap.get("fixed_prompt") or ""
-        if not fixed and not row_prompt:
-            p = resolve(get(self.cfg, "feishu.fixed_prompt.file", "config/gemini_prompt.txt"))
-            fixed = p.read_text(encoding="utf-8").strip() if p.exists() else ""
-        if not fixed and not row_prompt:
-            raise RuntimeError("固定提示词指令为空：请在 config.yaml 配置来源或写入 config/gemini_prompt.txt")
-
         existing = list(snap.get("scripts") or [])
         have_idx = {int(sc.get("source_index", -1)) for sc in existing} if not force else set()
         scripts_out = [] if force else existing
@@ -104,19 +117,7 @@ class Pipeline:
         todo_idx = [si for si in range(len(sources)) if si not in have_idx]
         if limit:
             todo_idx = todo_idx[:limit]
-        messages = {}
-        for si in todo_idx:
-            src = sources[si]
-            extra = (src.get("prompt_text") or "").strip()
-            if row_prompt:
-                if not extra:
-                    raise RuntimeError(f"源记录 {src.get('record_id')} 的提示词为空：固定指令配置指向素材表同一列，不能借用其他记录的提示词")
-                messages[si] = extra
-            else:
-                message = fixed
-                if extra and extra != fixed.strip():
-                    message += "\n\n【本次附加提示词】\n" + extra
-                messages[si] = message
+        messages = {si: build_script_prompt(self.cfg, snap, sources[si]) for si in todo_idx}
 
         gemini_acct = get(self.cfg, "accounts.gemini") or {}
         session = BrowserSession(

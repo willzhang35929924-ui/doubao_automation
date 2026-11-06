@@ -1,4 +1,6 @@
 let data, accounts = [], dirty = false;
+const captionRows = new Map();
+let captionRecognition = false, captionRequests = 0, stateFetchSequence = 0, sourceEditRevision = 0;
 const accountPending = new Map(), accountFeedback = new Map();
 const openingLoginAccounts = new Set(), openingAccountWindows = new Set();
 let accountFetchSequence = 0, accountMarkup = '', accountAddPending = false;
@@ -80,24 +82,203 @@ async function tab(t) {
 }
 function mediaUrl(path) { return '/media-file?path='+encodeURIComponent(path); }
 async function refresh() {
+  const sequence = ++stateFetchSequence;
   try {
     const next = await api('/api/state');
+    if (sequence !== stateFetchSequence) return;
     refreshRecovered('工作台');
     document.querySelector('#status').textContent = next.running ? '● 正在运行' : next.returncode === null ? '● 已就绪' : next.returncode === 0 ? '● 运行完成' : '● 运行未完成，请查看日志';
     document.querySelector('#runlog').textContent = next.log || '暂无运行日志';
-    if (dirty || document.activeElement?.closest('#rows')) return;
+    if (dirty || captionRequests || document.activeElement?.closest('#rows')) return;
     data = next;
-    document.querySelector('#rows').innerHTML = data.rows.map((x,i) => `<article class="row"><button class="btn red" data-record-id="${esc(x.record_id)}" onclick="deleteRow(this)">删除此记录</button><div class="grid"><label>keyword<input data-i="${i}" data-k="kw" value="${esc(x.keyword)}"></label><label>提示词<textarea data-i="${i}" data-k="prompt">${esc(x.prompt)}</textarea></label><div>视频 ${x.videos.length} 个</div><div>图片 ${x.images.length} 张<div class="thumbs">${x.images.map(im => `<img src="${mediaUrl(im)}">`).join('')}</div></div></div></article>`).join('') || '暂无素材记录';
-  } catch(e) { refreshFailed('工作台',e); }
+    const ids = new Set(data.rows.map(r => r.record_id));
+    for (const id of captionRows.keys()) if (!ids.has(id)) captionRows.delete(id);
+    document.querySelector('#rows').innerHTML = data.rows.map((x,i) => `<article class="row"><button class="btn red" data-record-id="${esc(x.record_id)}" onclick="deleteRow(this)">删除此记录</button><div class="grid"><label>keyword<input data-i="${i}" data-k="kw" value="${esc(x.keyword)}"></label><label>提示词<textarea data-i="${i}" data-k="prompt">${esc(x.prompt)}</textarea></label><div>视频 ${x.videos.length} 个</div><div>图片 ${x.images.length} 张<div class="thumbs">${x.images.map(im => `<img src="${mediaUrl(im)}">`).join('')}</div></div></div><div id="captions-${esc(x.record_id)}" data-caption-row="${esc(x.record_id)}">${renderCaptions(x)}</div></article>`).join('') || '暂无素材记录';
+  } catch(e) { if (sequence === stateFetchSequence) refreshFailed('工作台',e); }
 }
 async function saveRows(show = true) {
   if (!data) { await refresh(); if (!data) throw Error('素材尚未加载，请稍后重试'); }
+  const revision = sourceEditRevision;
   const rows = data.rows.map((r,i) => ({record_id:r.record_id,
     keyword:document.querySelector(`[data-i="${i}"][data-k="kw"]`)?.value ?? r.keyword,
     prompt_text:document.querySelector(`[data-i="${i}"][data-k="prompt"]`)?.value ?? r.prompt}));
   const result = await api('/api/edit', {rows});
-  dirty = false; if (show) msg('已保存 '+result.updated+' 条修改（运行时使用这些素材）');
+  if (revision === sourceEditRevision) dirty = false;
+  if (show) msg('已保存 '+result.updated+' 条修改（运行时使用这些素材）');
   await refresh(); return result;
+}
+function captionView(row) {
+  if (!captionRows.has(row.record_id)) captionRows.set(row.record_id,{images:{},video:{}});
+  return captionRows.get(row.record_id);
+}
+function hasCaptionDrafts() {
+  return [...captionRows.values()].some(view => view.images.draft || view.video.draft);
+}
+function captionSelection(row,kind) {
+  const images = kind === 'images';
+  const media = images ? (row.caption_images || []).map((path,index) => ({path,index})) : row.caption_videos || [];
+  const view = captionView(row)[kind], saved = row.captions?.video;
+  const initial = !saved?.stale && media.find(item => item.index === saved?.index) || (media.length === 1 ? media[0] : null);
+  const selected = 'target' in view ? media.find(item => item.index === view.target?.index && item.path === view.target?.path) : images ? null : initial;
+  return {media,index:selected?.index ?? null,
+    role:images ? 'product' : view.role || (!saved?.stale && saved?.role) || 'reference'};
+}
+function renderCaptions(row) {
+  const view = captionView(row);
+  const locked = view.pending ? ' disabled' : '';
+  const panels = ['images','video'].map(kind => {
+    const images = kind === 'images', label = images ? '图片' : '视频';
+    const {media,index,role} = captionSelection(row,kind);
+    const entry = row.captions?.[kind], {draft,candidate} = view[kind];
+    const options = media.map((item,i) => `<option value="${item.index}"${index === item.index ? ' selected' : ''}>${label} ${i+1} · ${esc(item.path.split(/[\\/]/).at(-1))}</option>`).join('');
+    const mediaLabel = images ? `当前产品整组（${media.length} 张${media.length > 6 ? '，最多识别 6 张' : ''}）` : '请选择一条已保存视频';
+    const unavailable = !media.length || (!images && index === null);
+    const roleChoice = images ? '' : `<label>用途 <select data-caption-choice="role" onchange="chooseCaption(this)"><option value="reference"${role === 'reference' ? ' selected' : ''}>创意参考</option><option value="product"${role === 'product' ? ' selected' : ''}>商品实拍</option></select></label>`;
+    const position = media.findIndex(item => item.index === entry?.index) + 1;
+    const scope = entry && (images && entry.index == null ? '产品整组' : `${label}${position ? ' '+position : ''}${images ? '' : ' · '+(entry.role === 'product' ? '商品实拍' : '创意参考')}`);
+    const editor = entry ? `<p class="muted">已保存${label}描述 · ${scope}${entry.stale ? ' · 素材已变化，请重新识别' : ''}</p>
+      <label>${label}描述<textarea data-caption-field="text"${entry.stale ? ' readonly' : ''}>${esc(draft?.text ?? entry.text)}</textarea></label>
+      ${images ? '' : `<label><input type="checkbox" style="width:auto" data-caption-field="enabled"${(draft?.enabled ?? entry.enabled) ? ' checked' : ''}${entry.stale ? ' disabled' : ''}> 带入最终提示词</label>`}
+      <div class="actions"><button class="btn gray" onclick="saveCaption(this)"${entry.stale ? ' disabled' : ''}>保存${label}描述</button><button class="btn gray" onclick="discardCaption(this)">还原已保存描述</button></div>` : '';
+    const proposed = candidate ? `<p class="muted">已保留原人工编辑。可比较以下新识别结果后再决定是否采用。</p>
+      <label>新${label}描述<textarea readonly>${esc(candidate.text)}</textarea></label>
+      <div class="actions"><button class="btn gray" onclick="saveCaption(this,true)">采用新描述</button><button class="btn gray" onclick="discardCaption(this,true)">保留原描述</button></div>` : '';
+    return `<fieldset class="row" data-caption-kind="${kind}"${locked}><legend>${label}识别</legend>
+      <div class="actions"><label>识别${label} <select data-caption-choice="media" onchange="chooseCaption(this)"><option value=""${index === null ? ' selected' : ''}>${mediaLabel}</option>${options}</select></label>${roleChoice}
+      <button class="btn gray" data-caption-generate data-caption-unavailable="${unavailable}" onclick="generateCaption(this)"${captionRecognition || unavailable ? ' disabled' : ''}>一键识别${label}</button></div>${editor}${proposed}</fieldset>`;
+  }).join('');
+  return `${panels}<p class="muted" role="status" data-caption-busy>${captionRecognition ? '素材识别正在进行，请等待完成。' : ''}</p>
+    <button class="btn gray" onclick="previewCaption(this)"${locked}>预览最终提示词</button>
+    <p class="muted" role="status" data-caption-feedback>${esc(view.pending || view.feedback || '')}</p>
+    <pre class="log" data-caption-preview${view.preview ? '' : ' hidden'}>${esc(view.preview || '')}</pre>`;
+}
+function captionContext(target) {
+  const id = target.closest('[data-caption-row]')?.dataset.captionRow;
+  const row = data?.rows.find(r => String(r.record_id) === id);
+  if (!row) return null;
+  const kind = target.closest('[data-caption-kind]')?.dataset.captionKind;
+  return {row,kind,view:captionView(row)};
+}
+function updateCaptionRow(row) {
+  const node = document.getElementById('captions-'+row.record_id);
+  if (node) node.innerHTML = renderCaptions(row);
+}
+function chooseCaption(target) {
+  const context = captionContext(target);
+  if (!context) return;
+  const {row,kind,view} = context;
+  if (target.dataset.captionChoice === 'role') view[kind].role = target.value;
+  else view[kind].target = target.value === '' ? null : captionSelection(row,kind).media.find(item => item.index === Number(target.value));
+  const button = target.closest('[data-caption-kind]').querySelector('[data-caption-generate]');
+  const {media,index} = captionSelection(row,kind);
+  button.dataset.captionUnavailable = String(!media.length || (kind === 'video' && index === null));
+  button.disabled = captionRecognition || button.dataset.captionUnavailable === 'true';
+}
+function clearCaptionPreview(row) {
+  const view = captionView(row);
+  if (!view.preview) return;
+  view.preview = '';
+  const output = document.getElementById('captions-'+row.record_id)?.querySelector('[data-caption-preview]');
+  if (output) { output.hidden = true; output.textContent = ''; }
+}
+function editCaption(target) {
+  const context = captionContext(target);
+  if (!context || !target.dataset.captionField) return;
+  const {row,kind,view} = context, entry = row.captions?.[kind];
+  if (!entry || entry.stale) return;
+  const draft = view[kind].draft ??= {base:entry,text:entry.text,enabled:entry.enabled};
+  if (target.dataset.captionField === 'text') draft.text = target.value;
+  else draft.enabled = target.checked;
+  view.feedback = '描述有未保存修改';
+  const feedback = document.getElementById('captions-'+row.record_id)?.querySelector('[data-caption-feedback]');
+  if (feedback) feedback.textContent = view.feedback;
+  clearCaptionPreview(row);
+}
+function discardCaption(target, candidate = false) {
+  const context = captionContext(target);
+  if (!context || context.view.pending) return;
+  const {row,kind,view} = context;
+  if (candidate) delete view[kind].candidate;
+  else delete view[kind].draft;
+  view.feedback = candidate ? '已保留原描述' : '已还原至上次保存的描述';
+  updateCaptionRow(row);
+}
+async function captionAction(row,label,action) {
+  const view = captionView(row);
+  if (view.pending) return;
+  view.pending = label; ++captionRequests; ++stateFetchSequence;
+  updateCaptionRow(row);
+  try { view.feedback = await action(); }
+  catch(e) { view.feedback = e.message === 'Failed to fetch' ? '连接工作台失败，请稍后重试' : e.message; }
+  finally { view.pending = ''; --captionRequests; ++stateFetchSequence; updateCaptionRow(row); }
+}
+function setCaptionRecognition(active) {
+  captionRecognition = active;
+  const container = document.querySelector('#rows');
+  for (const button of container.querySelectorAll('[data-caption-generate]')) {
+    button.disabled = active || button.dataset.captionUnavailable === 'true';
+  }
+  for (const status of container.querySelectorAll('[data-caption-busy]')) {
+    status.textContent = active ? '素材识别正在进行，请等待完成。' : '';
+  }
+}
+async function generateCaption(target) {
+  const context = captionContext(target);
+  if (!context || context.view.pending || captionRecognition) return;
+  const {row,kind,view} = context, label = kind === 'images' ? '图片' : '视频';
+  if (dirty || view[kind].draft) {
+    view.feedback = dirty ? '请先保存原提示词修改，再识别素材' : `请先保存或还原${label}描述，再重新识别`;
+    updateCaptionRow(row); return;
+  }
+  const {media,index,role} = captionSelection(row,kind);
+  if (!media.length || (kind === 'video' && index === null)) return;
+  setCaptionRecognition(true);
+  try {
+    await captionAction(row,`正在识别${label}，请等待完成…`,async () => {
+      const result = await api('/api/captions/generate',{record_id:row.record_id,kind,index,role});
+      (row.captions ??= {})[kind] = result.entry;
+      clearCaptionPreview(row);
+      if (typeof result.candidate_text === 'string') {
+        view[kind].candidate = {text:result.candidate_text,base:result.entry,target:result.candidate_target || result.entry};
+        return `已识别${label}，原人工编辑已保留`;
+      }
+      delete view[kind].candidate;
+      return `${label}描述已识别并保存`;
+    });
+  } finally { setCaptionRecognition(false); }
+}
+async function saveCaption(target, useCandidate = false) {
+  const context = captionContext(target);
+  if (!context) return;
+  const {row,kind,view} = context, panel = view[kind], entry = row.captions?.[kind];
+  const selected = useCandidate ? panel.candidate : panel.draft;
+  if (!entry || !selected || (!useCandidate && entry.stale)) return;
+  const base = selected.base, binding = useCandidate ? selected.target : base;
+  await captionAction(row,'正在保存描述…',async () => {
+    const result = await api('/api/captions/save',{record_id:row.record_id,kind,text:selected.text,
+      revision:base.revision,fingerprint:binding.fingerprint,index:binding.index,role:binding.role,
+      enabled:useCandidate ? (panel.draft?.enabled ?? entry.enabled) : selected.enabled});
+    row.captions[kind] = result.entry;
+    delete panel.draft; delete panel.candidate;
+    clearCaptionPreview(row);
+    return '素材描述已保存';
+  });
+}
+async function previewCaption(target) {
+  const context = captionContext(target);
+  if (!context || context.view.pending) return;
+  const {row,view} = context;
+  if (dirty || view.images.draft || view.video.draft) {
+    view.feedback = '请先保存原提示词及素材描述的修改，再预览';
+    updateCaptionRow(row); return;
+  }
+  const revision = sourceEditRevision;
+  await captionAction(row,'正在读取最终提示词…',async () => {
+    const result = await api('/api/captions/preview',{record_id:row.record_id});
+    if (revision !== sourceEditRevision) return '原提示词有新修改，请保存后重新预览';
+    view.preview = result.prompt;
+    return '已显示最终提示词预览';
+  });
 }
 let syncPending = false;
 async function syncFeishu() {
@@ -106,12 +287,15 @@ async function syncFeishu() {
   const status = document.querySelector('#sync-result');
   const show = text => { if (status) status.textContent = text; msg(text); };
   if (dirty) { show('请先保存本地修改，再同步飞书'); return; }
+  if (captionRequests) { show('素材描述操作正在进行，请稍候再同步飞书'); return; }
+  if (hasCaptionDrafts()) { show('请先保存或还原素材描述，再同步飞书'); return; }
   syncPending = true;
   if (button) { button.disabled = true; button.textContent = '同步中…'; }
   show('正在连接飞书并下载素材，请稍候…');
   try {
     const result = await api('/api/sync', {});
     show(`同步完成：产品 ${result.products ?? 0} 条，素材 ${result.sources ?? 0} 条。`);
+    for (const row of data?.rows || []) clearCaptionPreview(row);
     await refresh();
   } catch(e) {
     const detail = e.message === 'Failed to fetch' ? '无法连接工作台，请确认服务已启动' : e.message;
@@ -129,9 +313,14 @@ async function upload() {
 }
 async function run() {
   try {
+    if (captionRequests) throw Error('素材描述操作正在进行，请稍候再运行');
     const current = await api('/api/state');
     const pendingEdits = dirty;
-    if (!current.can_resume) await saveRows(false);
+    if (!current.can_resume) {
+      if (hasCaptionDrafts()) throw Error('请先保存或还原素材描述，再开启新任务');
+      await saveRows(false);
+      if (dirty) throw Error('提示词有新的修改，请保存后再开启新任务');
+    }
     const result = await api('/api/run',{});
     msg((result.message || (result.resumed ? '继续上次'+result.script_count+'个脚本，已完成视频不重复生成' : '已启动新任务'))
       + (current.can_resume && pendingEdits ? '。未保存修改保留供后续新任务' : ''));
@@ -349,7 +538,11 @@ async function openFolder(button) {
   } catch(e) { status.textContent = e.message; msg(e.message); }
   finally { videoFolderFeedback.set(path,{text:status.textContent,pending:false}); button.disabled = false; }
 }
-document.querySelector('#rows').addEventListener('input',() => { dirty = true; });
+document.querySelector('#rows').addEventListener('input',event => {
+  if (event?.target?.closest('[data-caption-row]')) { editCaption(event.target); return; }
+  dirty = true; ++sourceEditRevision;
+  for (const row of data?.rows || []) clearCaptionPreview(row);
+});
 document.querySelector('[onclick="saveRows()"]').onclick = () => saveRows().catch(e => msg('保存失败：'+e.message));
 refresh();
 setInterval(() => { refresh(); if (document.querySelector('#accounts').style.display !== 'none') loadAccounts().catch(e => refreshFailed('账号',e)); if (document.querySelector('#videos').style.display !== 'none') loadVideos().catch(e => refreshFailed('视频',e)); },4000);
