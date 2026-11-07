@@ -28,6 +28,8 @@ workspace/
 !.env.example
 /config/config.yaml
 /config/gemini_prompt.txt
+/config/caption_settings.json
+/config/caption_settings.key
 /postprocess_setup/seedvr_config.json
 
 # Runtime media, models, browser state and bundled native tools

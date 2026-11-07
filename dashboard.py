@@ -185,6 +185,9 @@ def bad_value(exc):
 @app.get('/')
 def home():
     html = HTML.replace('<meta charset="utf-8">', '<meta charset="utf-8"><meta name="csrf-token" content="{{ csrf_token }}">')
+    html = html.replace('<button class="btn" onclick="run()">开启运行</button>',
+                        '<button type="button" class="btn gray" aria-haspopup="dialog" onclick="openCaptionModelSettings()">识别模型</button>'
+                        '<button class="btn" onclick="run()">开启运行</button>')
     html = html.replace('<button class="btn red" onclick="stop()">停止</button>',
                         '<button class="btn red" onclick="stop()">停止</button>'
                         '<button class="btn gray" onclick="previewClearHistory()">清除历史记录及对应文件（仅预览）</button>')
@@ -382,8 +385,28 @@ def _caption_target_identity(target):
             tuple(str(Path(path).resolve()) for path in target.get('paths',())))
 
 
+@app.get('/api/captions/settings')
+def caption_settings_get():
+    from doubao_automation.caption_settings import public_caption_settings
+
+    return jsonify(public_caption_settings())
+
+
+@app.post('/api/captions/settings')
+def caption_settings_save():
+    from doubao_automation.caption_settings import save_caption_settings
+
+    with lock:
+        if caption_model_lock.locked():
+            raise CaptionConflict('素材识别正在进行，请完成后再修改识别模型设置')
+        return jsonify(save_caption_settings(request.get_json(silent=True)))
+
+
 @app.post('/api/captions/generate')
 def caption_generate():
+    from doubao_automation.caption_runtime import CaptionRuntimeError, DEFAULT_CAPTION_PROMPTS, generate_caption
+    from doubao_automation.caption_settings import read_caption_settings
+
     _,record_id,kind,index,role=_caption_request()
     if not caption_model_lock.acquire(blocking=False):
         return jsonify(error='另一条 Caption 正在生成，请等待完成'),409
@@ -395,10 +418,24 @@ def caption_generate():
             old_entry=copy.deepcopy(caption_entry(snap,target))
             target_id=_caption_target_identity(target)
             paths=list(target['paths'])
-        from doubao_automation.caption_runtime import CaptionRuntimeError, generate_caption
+            settings=read_caption_settings()
+        prompt_name='image_prompt' if kind=='images' else f'{role}_video_prompt'
+        instructions=settings[prompt_name]
+        use_cloud=all(settings[name] for name in ('base_url','model','api_key'))
         try:
-            candidate=generate_caption(paths,kind,role)
+            if use_cloud:
+                from doubao_automation.caption_cloud import generate_cloud_caption
+
+                candidate=generate_cloud_caption(
+                    paths,kind,role,base_url=settings['base_url'],model=settings['model'],
+                    api_key=settings['api_key'],instructions=instructions)
+            elif instructions==DEFAULT_CAPTION_PROMPTS[prompt_name]:
+                candidate=generate_caption(paths,kind,role)
+            else:
+                candidate=generate_caption(paths,kind,role,instructions=instructions)
         except CaptionRuntimeError as exc:
+            if use_cloud:
+                return jsonify(error=str(exc),code='caption_cloud_error'),502
             return jsonify(error=str(exc),code='caption_runtime_unavailable'),503
         except RuntimeError as exc:
             app.logger.error('Caption 模型推理失败: %s', type(exc).__name__)
@@ -525,7 +562,7 @@ def run():
         if running():
             return jsonify(error='流水线已在运行'),409
         if caption_model_lock.locked():
-            return jsonify(error='本地素材识别正在进行，请完成后再开始运行'),409
+            return jsonify(error='素材识别正在进行，请完成后再开始运行'),409
         if account_windows_open():
             raise ValueError('账号窗口仍在使用，请关闭账号或登录窗口后再运行')
         require_doubao_accounts(load_config())

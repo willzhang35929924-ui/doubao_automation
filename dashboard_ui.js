@@ -280,6 +280,112 @@ async function previewCaption(target) {
     return '已显示最终提示词预览';
   });
 }
+const captionModelFields = ['base_url','model','image_prompt','product_video_prompt','reference_video_prompt'];
+let captionModelDialog, captionModelSettings, captionModelLoading = 0, captionModelSaving = false;
+
+function createCaptionModelDialog() {
+  const dialog = document.createElement('dialog');
+  dialog.setAttribute('aria-labelledby','caption-model-title');
+  dialog.style.cssText = 'width:min(680px,calc(100% - 24px));max-height:calc(100vh - 24px);border:1px solid #d2d2d7;border-radius:16px;padding:20px';
+  dialog.innerHTML = `<h2 id="caption-model-title">识别模型设置</h2>
+    <p data-model-mode class="muted"></p>
+    <p class="muted">地址、模型名称或 API Key 缺少任一项时，使用本地分析。三项齐备后，识别会将图片或视频抽帧发送至你配置的 HTTPS OpenAI 兼容 API。</p>
+    <form>
+      <fieldset style="border:0;padding:0;margin:0" disabled>
+        <label>API 地址 <input name="base_url" type="url" placeholder="https://api.example.com/v1" spellcheck="false" autocomplete="off"></label>
+        <label>模型名称 <input name="model" spellcheck="false" autocomplete="off"></label>
+        <label>API Key <input name="api_key" type="password" autocomplete="new-password" aria-describedby="caption-model-key-note"></label>
+        <p id="caption-model-key-note" class="muted"></p>
+        <label><input name="clear_api_key" type="checkbox" style="width:auto"> 清除已保存的 API Key</label>
+        <p><label>图片识别提示词 <textarea name="image_prompt"></textarea></label></p>
+        <p><label>商品实拍视频提示词 <textarea name="product_video_prompt"></textarea></label></p>
+        <p><label>创意参考视频提示词 <textarea name="reference_video_prompt"></textarea></label></p>
+        <button class="btn" type="submit">保存设置</button>
+      </fieldset>
+      <p class="muted" data-model-feedback role="status" aria-live="polite"></p>
+      <button class="btn gray" type="button" data-model-close>关闭</button>
+    </form>`;
+  const form = dialog.querySelector('form');
+  const key = form.elements.namedItem('api_key');
+  const clear = form.elements.namedItem('clear_api_key');
+  form.addEventListener('submit',saveCaptionModelSettings);
+  clear.addEventListener('change',() => { key.disabled = clear.checked; });
+  dialog.querySelector('[data-model-close]').addEventListener('click',() => {
+    if (!captionModelSaving) dialog.close();
+  });
+  dialog.addEventListener('cancel',event => { if (captionModelSaving) event.preventDefault(); });
+  dialog.addEventListener('close',() => { if (!dialog.open) key.value = ''; });
+  document.body.append(dialog);
+  return dialog;
+}
+function showCaptionModelSettings(settings) {
+  const dialog = captionModelDialog, fields = dialog.querySelector('form').elements;
+  for (const name of captionModelFields) fields.namedItem(name).value = settings?.[name] ?? '';
+  const key = fields.namedItem('api_key'), clear = fields.namedItem('clear_api_key');
+  const configured = settings?.api_key_configured === true;
+  captionModelSettings = settings && {base_url:settings.base_url ?? '',api_key_configured:configured};
+  key.value = ''; key.disabled = false;
+  clear.checked = false; clear.disabled = !configured;
+  dialog.querySelector('#caption-model-key-note').textContent = configured
+    ? '已保存 API Key（****）。地址不变时可留空沿用。更换地址请填写新 Key，或勾选清除。'
+    : '尚未保存 API Key。';
+  dialog.querySelector('[data-model-mode]').textContent = settings
+    ? (settings.mode === 'cloud' ? '当前使用云端识别' : '当前使用本地分析') : '';
+}
+async function openCaptionModelSettings() {
+  const dialog = captionModelDialog ??= createCaptionModelDialog();
+  if (dialog.open) return;
+  const sequence = ++captionModelLoading;
+  const inputs = dialog.querySelector('fieldset'), feedback = dialog.querySelector('[data-model-feedback]');
+  showCaptionModelSettings(null);
+  inputs.disabled = true;
+  feedback.textContent = '正在读取识别模型设置…';
+  dialog.showModal();
+  try {
+    const settings = await api('/api/captions/settings');
+    if (!dialog.open || sequence !== captionModelLoading) return;
+    showCaptionModelSettings(settings);
+    inputs.disabled = false;
+    feedback.textContent = '';
+  } catch(error) {
+    if (dialog.open && sequence === captionModelLoading) feedback.textContent = '读取设置失败。'+error.message;
+  }
+}
+function captionModelAddress(value) {
+  return value.trim().replace(/\/+$/,'').replace(/^https:\/\/[^/?#]+/i,origin=>origin.toLowerCase());
+}
+async function saveCaptionModelSettings(event) {
+  event.preventDefault();
+  if (captionModelSaving || !captionModelSettings) return;
+  const dialog = captionModelDialog, fields = event.currentTarget.elements;
+  const inputs = dialog.querySelector('fieldset'), feedback = dialog.querySelector('[data-model-feedback]');
+  const payload = Object.fromEntries(captionModelFields.map(name => [name,fields.namedItem(name).value]));
+  payload.base_url = captionModelAddress(payload.base_url);
+  payload.model = payload.model.trim();
+  const key = fields.namedItem('api_key').value.trim();
+  const clear = fields.namedItem('clear_api_key').checked;
+  const oldAddress = captionModelAddress(captionModelSettings.base_url);
+  if (captionModelSettings.api_key_configured && payload.base_url !== oldAddress && !key && !clear) {
+    feedback.textContent = '更换 API 地址需要填写新 API Key，或勾选清除已保存的 Key。';
+    return;
+  }
+  if (clear) payload.clear_api_key = true;
+  else if (key) payload.api_key = key;
+  captionModelSaving = true;
+  const close = dialog.querySelector('[data-model-close]');
+  inputs.disabled = true; close.disabled = true;
+  feedback.textContent = '正在保存设置…';
+  try {
+    showCaptionModelSettings(await api('/api/captions/settings',payload));
+    feedback.textContent = '识别模型设置已保存。';
+  } catch(error) {
+    const detail = key ? error.message.replaceAll(key,'****') : error.message;
+    feedback.textContent = '保存设置失败。'+detail;
+  } finally {
+    captionModelSaving = false;
+    inputs.disabled = false; close.disabled = false;
+  }
+}
 let syncPending = false;
 async function syncFeishu() {
   if (syncPending) return;

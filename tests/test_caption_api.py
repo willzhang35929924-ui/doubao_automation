@@ -7,7 +7,8 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import dashboard
-from doubao_automation import caption_context
+from doubao_automation import caption_context, caption_settings
+from doubao_automation.caption_runtime import CaptionRuntimeError
 from doubao_automation.state import JsonStore
 
 
@@ -30,6 +31,7 @@ class CaptionApiTests(unittest.TestCase):
                       patch.object(dashboard,'LOGS_DIR',self.logs),
                       patch.object(caption_context,'PRODUCTS_DIR',self.products),
                       patch.object(caption_context,'SOURCES_DIR',self.sources),
+                      patch.object(caption_settings,'CONFIG_DIR',self.root/'config'),
                       patch.object(dashboard,'load_config',return_value=self.cfg),
                       patch.object(dashboard,'running',return_value=False),
                       patch.object(dashboard,'caption_model_lock',threading.Lock())]
@@ -223,6 +225,70 @@ class CaptionApiTests(unittest.TestCase):
                      {**self.target(), 'record_id':'missing'}):
             response=self.client.post('/api/captions/generate',json=body)
             self.assertGreaterEqual(response.status_code,400)
+
+    def test_settings_are_masked_on_save_and_reload(self):
+        endpoint = '/api/captions/settings'
+        defaults = self.client.get(endpoint).json
+        self.assertEqual(defaults['mode'], 'local')
+        self.assertTrue(defaults['image_prompt'])
+        self.assertIn('openCaptionModelSettings()', self.client.get('/').get_data(as_text=True))
+        update = dict(base_url='https://vision.example.test/v1', model='vision',
+                      api_key='fixture-only-key', image_prompt='识别图片中的图案')
+        self.assertEqual(dashboard.app.test_client().post(endpoint, json=update).status_code, 403)
+        saved = self.client.post(endpoint, json=update)
+        self.assertEqual(saved.status_code, 200, saved.get_json())
+        self.assertEqual(saved.json['mode'], 'cloud')
+        self.assertEqual(saved.json['api_key_mask'], '****')
+        self.assertNotIn(update['api_key'], saved.get_data(as_text=True))
+        reloaded = self.new_client().get(endpoint)
+        self.assertEqual(reloaded.json, saved.json)
+        edited = self.client.post(endpoint, json={'model': 'updated-vision'})
+        self.assertTrue(edited.json['api_key_configured'])
+        self.assertEqual(edited.json['image_prompt'], update['image_prompt'])
+
+    def test_missing_each_cloud_field_uses_local_with_saved_prompt(self):
+        full = dict(base_url='https://vision.example.test/v1', model='vision',
+                    api_key='fixture-only-key', image_prompt='优先描述图案')
+        for field in ('base_url', 'model', 'api_key'):
+            with self.subTest(field=field):
+                payload = full | {field: ''}
+                if field == 'api_key':
+                    payload['clear_api_key'] = True
+                saved = self.client.post('/api/captions/settings', json=payload)
+                self.assertEqual(saved.json['mode'], 'local')
+                with patch('doubao_automation.caption_cloud.generate_cloud_caption') as cloud:
+                    local = Mock(return_value='本地识别结果。')
+                    response = self.generated(local)
+                self.assertEqual(response.status_code, 200, response.get_json())
+                self.assertEqual(local.call_args.kwargs, {'instructions': full['image_prompt']})
+                cloud.assert_not_called()
+
+    def test_configured_cloud_receives_target_and_corresponding_instructions(self):
+        options = dict(base_url='https://vision.example.test/v1', model='vision',
+                       api_key='fixture-only-key', image_prompt='识别图案',
+                       product_video_prompt='描述商品实拍', reference_video_prompt='总结参考镜头')
+        self.assertEqual(self.client.post('/api/captions/settings', json=options).status_code, 200)
+        with patch('doubao_automation.caption_cloud.generate_cloud_caption',
+                   return_value='已识别素材。') as cloud, \
+             patch('doubao_automation.caption_runtime.generate_caption') as local:
+            for kind, role, prompt in (('images', 'product', 'image_prompt'),
+                                       ('video', 'product', 'product_video_prompt'),
+                                       ('video', 'reference', 'reference_video_prompt')):
+                with self.subTest(kind=kind, role=role):
+                    response = self.client.post('/api/captions/generate', json=self.target(kind, role=role))
+                    self.assertEqual(response.status_code, 200, response.get_json())
+                    self.assertEqual(cloud.call_args.args[1:], (kind, role))
+                    self.assertEqual(cloud.call_args.kwargs,
+                                     {name: options[name] for name in ('base_url', 'model', 'api_key')}
+                                     | {'instructions': options[prompt]})
+            local.assert_not_called()
+            cloud.side_effect = CaptionRuntimeError('云端识别服务暂不可用')
+            before = self.store.snapshot()
+            failed = self.client.post('/api/captions/generate', json=self.target())
+            self.assertEqual(failed.status_code, 502)
+            self.assertEqual(failed.json['code'], 'caption_cloud_error')
+            self.assertEqual(self.store.snapshot(), before)
+            local.assert_not_called()
 
 
 if __name__=='__main__':unittest.main()
