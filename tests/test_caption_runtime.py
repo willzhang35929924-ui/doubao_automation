@@ -1,4 +1,5 @@
 import contextlib
+import json
 import shutil
 import subprocess
 import tempfile
@@ -24,12 +25,15 @@ class TestCaptionSetup(unittest.TestCase):
                 with self.assertRaisesRegex(runtime.CaptionRuntimeError, "scripts/setup_caption_runtime.sh"):
                     runtime.generate_caption([media], "images", "product")
 
-    def test_page_caption_uses_text_only_offline_worker(self):
+    def test_page_caption_preserves_attribute_lines_for_text_only_offline_worker(self):
         with (
             patch.object(runtime, "_local_model", return_value=(Path("/fixture/python"), Path("/fixture/model"))),
             patch.object(runtime, "_run_worker", return_value={"caption": "红色水杯"}) as worker,
         ):
-            actual = runtime.generate_page_caption("商品水杯", "红色水杯", instructions="重点描述颜色")
+            actual = runtime.generate_page_caption(
+                "商品水杯", "红色水杯\r\n Battery  in product \r\n No \r\nMaterial\nCeramic",
+                instructions="重点描述颜色",
+            )
         self.assertEqual(actual, "红色水杯")
         python, request = worker.call_args.args
         self.assertEqual(python, Path("/fixture/python"))
@@ -38,7 +42,11 @@ class TestCaptionSetup(unittest.TestCase):
         system, user = request["messages"]
         self.assertEqual((system["role"], user["role"]), ("system", "user"))
         self.assertIn("重点描述颜色", system["content"])
-        self.assertIn("红色水杯", user["content"])
+        self.assertIn("否定值不得写成肯定事实", system["content"])
+        self.assertEqual(
+            json.loads(user["content"])["网页文字"],
+            "红色水杯\nBattery in product\nNo\nMaterial\nCeramic",
+        )
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires local FFmpeg tools")

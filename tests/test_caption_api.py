@@ -354,6 +354,30 @@ class CaptionApiTests(unittest.TestCase):
             remote.assert_called_once()
             self.assertEqual(before, self.store.snapshot())
 
+    def test_tiktok_uses_browser_before_model_and_stops_at_verification(self):
+        url = 'https://shop.tiktok.com/us/pdp/1732813990412915186'
+        payload = dict(record_id='fixture-record', url=url + '?source=feed', revision=None)
+        with patch('doubao_automation.caption_browser.read_browser_product_page',
+                   return_value=ProductPage(url, '公开商品', '浏览器显示 PP 棉玩具与蒸笼外观收纳篮。')) as browser, \
+             patch('doubao_automation.caption_page.fetch_product_page') as static, \
+             patch('doubao_automation.caption_runtime.generate_page_caption',
+                   return_value='商品页面展示 PP 棉玩具与蒸笼外观收纳篮。') as model:
+            result = self.client.post('/api/captions/link/generate', json=payload)
+            self.assertEqual(result.status_code, 200, result.json)
+            browser.assert_called_once_with(url)
+            static.assert_not_called()
+            model.assert_called_once()
+            saved = result.json['entry']
+            before = self.store.snapshot()
+            browser.side_effect = CaptionPageError('商品页面需要安全验证，读取已停止')
+            rejected = self.client.post('/api/captions/link/generate',
+                                        json={**payload, 'revision': saved['revision']})
+            self.assertEqual(rejected.status_code, 502, rejected.json)
+            self.assertEqual(rejected.json['code'], 'caption_page_unavailable')
+            self.assertEqual(before, self.store.snapshot())
+            model.assert_called_once()
+            static.assert_not_called()
+
     def test_link_conflict_protects_edits_and_rejects_private_url_before_fetch(self):
         generate = '/api/captions/link/generate'
         save = '/api/captions/link/save'

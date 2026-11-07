@@ -64,6 +64,12 @@ def _is_public_ip(address):
     return not any(address in network for network in _V4_SPECIAL)
 
 
+def is_tiktok_product_url(url: str) -> bool:
+    parsed = urlsplit(url)
+    return parsed.hostname == 'shop.tiktok.com' and bool(
+        re.fullmatch(r'/[a-z]{2}/pdp/(?:[^/]+/)?[0-9]{15,20}/?', parsed.path))
+
+
 def normalize_page_url(url: str) -> str:
     """Validate URL syntax and literal addresses without making a DNS request."""
     invalid = '请输入完整的公开 HTTP 或 HTTPS 商品链接。'
@@ -112,7 +118,7 @@ def normalize_page_url(url: str) -> str:
     if path.startswith('//'):
         raise CaptionPageError(invalid)
     # Use the public product URL without share/navigation tracking.
-    if host == 'shop.tiktok.com' and re.fullmatch(r'/[a-z]{2}/pdp/(?:[^/]+/)?[0-9]{15,20}/?', path):
+    if is_tiktok_product_url(urlunsplit((parsed.scheme, authority, path, '', ''))):
         kept = []
         for field in query.split('&'):
             name = unquote(field.partition('=')[0]).lower()
@@ -574,6 +580,16 @@ def _extract_page(url, markup):
         '页面可见文字：\n' + visible if visible else '',
     ) if part]
     return ProductPage(url, title, '\n'.join(sections)[:_MAX_TEXT])
+
+
+def read_product_page(url: str) -> ProductPage:
+    """Use the isolated browser for TikTok product pages."""
+    current = normalize_page_url(url)
+    if is_tiktok_product_url(current):
+        from .caption_browser import read_browser_product_page
+
+        return read_browser_product_page(current)
+    return fetch_product_page(current)
 
 
 def fetch_product_page(url: str) -> ProductPage:

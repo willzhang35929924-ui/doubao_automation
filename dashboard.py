@@ -531,7 +531,7 @@ def _link_caption_for(snapshot, record_id, revision):
 @app.post('/api/captions/link/generate')
 def caption_link_generate():
     from doubao_automation.caption_cloud import generate_cloud_page_caption
-    from doubao_automation.caption_page import CaptionPageError, fetch_product_page
+    from doubao_automation.caption_page import CaptionPageError, read_product_page
     from doubao_automation.caption_runtime import CaptionRuntimeError, generate_page_caption
     from doubao_automation.caption_settings import read_caption_settings
 
@@ -546,7 +546,7 @@ def caption_link_generate():
             binding = link_caption_binding(snapshot, source)
             settings = read_caption_settings()
         try:
-            page = fetch_product_page(url)
+            page = read_product_page(url)
         except CaptionPageError as exc:
             return jsonify(error=str(exc), code='caption_page_unavailable'), 502
         except Exception as exc:
