@@ -14,7 +14,7 @@ import zlib
 from collections import deque
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from urllib.parse import quote, urljoin, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 from urllib.request import getproxies
 
 
@@ -111,6 +111,16 @@ def normalize_page_url(url: str) -> str:
     # HTTP origin-form must begin with a single slash.
     if path.startswith('//'):
         raise CaptionPageError(invalid)
+    # Use the public product URL without share/navigation tracking.
+    if host == 'shop.tiktok.com' and re.fullmatch(r'/[a-z]{2}/pdp/(?:[^/]+/)?[0-9]{15,20}/?', path):
+        kept = []
+        for field in query.split('&'):
+            name = unquote(field.partition('=')[0]).lower()
+            if name in ('source', 'enter_method', 'first_entrance',
+                        'first_entrance_position', 'first_entrance_tt_scene') or name.startswith('btm_'):
+                continue
+            kept.append(field)
+        query = '&'.join(kept)
     normalized = urlunsplit((parsed.scheme, authority, path, query, ''))
     if len(normalized) > MAX_PAGE_URL_LENGTH:
         raise CaptionPageError(invalid)
@@ -551,6 +561,9 @@ def _extract_page(url, markup):
     description = meta.get('og:description') or meta.get('twitter:description') or meta.get('description') or ''
     details = _product_details(parser.products)
     visible = '\n'.join(dict.fromkeys(parser.main_lines + parser.lines))
+    verification_titles = ('security check', 'robot check', 'verify you are human', '安全验证', '人机验证')
+    if not details and any(value.lower().startswith(verification_titles) for value in (title, parser.title)):
+        raise CaptionPageError('商品网页返回安全验证页，当前无法自动读取商品内容。请使用无需验证的公开商品链接。')
     if (not details and any(title.lower().startswith(prefix) for prefix in _BLOCKED_TITLES)
             or not details and not description and len(visible) < 40):
         raise CaptionPageError('没有读取到公开的商品内容，网页可能需要登录、验证或由脚本加载。')

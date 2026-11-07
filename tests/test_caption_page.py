@@ -51,6 +51,32 @@ class CaptionPageTests(unittest.TestCase):
         self.assertEqual(page.normalize_page_url('https://[2606:4700:4700::1111]'), 'https://[2606:4700:4700::1111]/')
         self.assertEqual(page.normalize_page_url('http://8.8.8.8:80/'), 'http://8.8.8.8/')
 
+    def test_tiktok_product_share_link_drops_navigation_tracking_and_keeps_variants(self):
+        product = 'https://shop.tiktok.com/us/pdp/1732813990412915186'
+        tracking = ('source=ecommerce_store&enter_method=feed_list_store_list_product'
+                    '&first_entrance=anchor&first_entrance_position=pdp_seller_name'
+                    '&first_entrance_tt_scene=seo&btm_pre=a18064.b34457'
+                    '&btm_pre_show_id=fixture&btm_transfer_id=fixture&btm_ppre=fixture')
+        self.assertEqual(page.normalize_page_url(product + '?' + tracking), product)
+        variant = product + '?sku_id=123&variant=red%2Bblue&source_id=keep&sku_id=456&first_entrance_custom=keep'
+        self.assertEqual(page.normalize_page_url(variant + '&s%6furce=feed&btm_pre=x'), variant)
+        self.assertEqual(page.normalize_page_url(variant), variant)
+        slugged = 'https://shop.tiktok.com/us/pdp/plush-dumpling/1732813990412915186/'
+        self.assertEqual(page.normalize_page_url(slugged + '?source=feed'), slugged)
+        for other in ('https://shop.example.com/us/pdp/1732813990412915186',
+                      'https://shop.tiktok.com/us/store/1732813990412915186',
+                      'https://shop.tiktok.com.evil.com/us/pdp/1732813990412915186'):
+            self.assertEqual(page.normalize_page_url(other + '?source=feed'), other + '?source=feed')
+
+    def test_tiktok_share_link_fetches_public_product_route_before_extraction(self):
+        product = 'https://shop.tiktok.com/us/pdp/1732813990412915186'
+        markup = '<title>Plush Dumplings</title><main>PP cotton plush dumplings in a gift box.</main>'
+        with patch.object(page, '_request_page', return_value=(None, markup)) as get:
+            found = page.fetch_product_page(product + '?source=ecommerce_store&btm_transfer_id=fixture')
+        self.assertEqual(get.call_args.args[0], product)
+        self.assertEqual(found.url, product)
+        self.assertIn('PP cotton', found.text)
+
     def test_unsafe_urls_never_resolve(self):
         with patch.object(page.socket, 'getaddrinfo') as resolve:
             for link in (
@@ -275,6 +301,13 @@ class CaptionPageTests(unittest.TestCase):
         with patch.object(page._PageParser, 'feed', side_effect=AssertionError('raw response')):
             with self.assertRaisesRegex(page.CaptionPageError, '无法解析'):
                 page._extract_page(URL, '')
+
+    def test_security_check_shell_reports_verification_without_reading_or_exposing_challenge(self):
+        shell = ('<title>Security Check</title><script id="captcha-config" type="application/json">'
+                 '{"challenge":"private-challenge-token"}</script><main>Please verify you are human.</main>')
+        with self.assertRaisesRegex(page.CaptionPageError, '安全验证') as failed:
+            page._extract_page(URL, shell)
+        self.assertNotIn('private-challenge-token', str(failed.exception))
 
     def test_reject_non_html_and_bound_identity_and_gzip_size(self):
         with patch.object(page, '_resolve_public_addresses', return_value=[]):
