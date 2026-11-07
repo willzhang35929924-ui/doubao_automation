@@ -21,6 +21,14 @@ class CaptionSettingsError(ValueError):
     """A safe, user-facing caption settings error."""
 
 
+def _crypto():
+    try:
+        from cryptography.fernet import Fernet, InvalidToken
+    except ImportError:
+        raise CaptionSettingsError("云端识别需要加密依赖，请在项目环境安装 requirements.txt") from None
+    return Fernet, InvalidToken
+
+
 def _defaults():
     from .caption_runtime import DEFAULT_CAPTION_PROMPTS
 
@@ -52,7 +60,7 @@ def _ensure_config_dir():
 
 
 def _read_key(path: Path):
-    from cryptography.fernet import Fernet
+    Fernet, _ = _crypto()
 
     try:
         if path.is_symlink() or (os.name != "nt" and stat.S_IMODE(path.stat().st_mode) & 0o077):
@@ -64,7 +72,7 @@ def _read_key(path: Path):
 
 
 def _create_key(path: Path):
-    from cryptography.fernet import Fernet
+    Fernet, _ = _crypto()
 
     _ensure_config_dir()
     if path.exists() or path.is_symlink():
@@ -87,8 +95,6 @@ def _create_key(path: Path):
 
 
 def _load():
-    from cryptography.fernet import InvalidToken
-
     settings_path, key_path = _paths()
     defaults = _defaults()
     if not settings_path.exists() and not settings_path.is_symlink():
@@ -109,7 +115,11 @@ def _load():
         if not isinstance(token, str) or ("api_key" in stored):
             raise ValueError
         if token:
-            binding = json.loads(_read_key(key_path).decrypt(token.encode("ascii")).decode("utf-8"))
+            _, InvalidToken = _crypto()
+            try:
+                binding = json.loads(_read_key(key_path).decrypt(token.encode("ascii")).decode("utf-8"))
+            except InvalidToken:
+                raise ValueError from None
             if (not isinstance(binding, dict) or binding.get("base_url") != base_url
                     or not isinstance(binding.get("api_key"), str)):
                 raise ValueError
@@ -123,7 +133,9 @@ def _load():
         }
         _validate_limits(settings)
         return settings
-    except (OSError, UnicodeError, ValueError, InvalidToken, TypeError) as exc:
+    except CaptionSettingsError:
+        raise
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
         raise CaptionSettingsError("识别模型设置损坏或无法解密；请从本机备份恢复") from exc
 
 
@@ -192,8 +204,6 @@ def _atomic_write(path: Path, content: bytes):
 
 def save_caption_settings(payload):
     """Merge a UI update and atomically persist its encrypted API key."""
-    from cryptography.fernet import Fernet
-
     if not isinstance(payload, dict):
         raise CaptionSettingsError("识别模型设置必须是 JSON 对象")
     allowed = {"base_url", "model", "api_key", "clear_api_key", *_PROMPT_KEYS}
@@ -231,7 +241,7 @@ def save_caption_settings(payload):
         settings_path, key_path = _paths()
         token = ""
         if updated["api_key"]:
-            fernet: Fernet = _create_key(key_path)
+            fernet = _create_key(key_path)
             binding = json.dumps({"base_url": updated["base_url"], "api_key": updated["api_key"]},
                                  ensure_ascii=False, sort_keys=True).encode("utf-8")
             token = fernet.encrypt(binding).decode("ascii")

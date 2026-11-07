@@ -1,5 +1,6 @@
 """Caption configuration never touches the user's real config directory."""
 
+import builtins
 import json
 import os
 import stat
@@ -135,6 +136,35 @@ class CaptionSettingsTests(unittest.TestCase):
                 self.assertEqual(settings_file.read_bytes(), before_file)
                 self.assertEqual(key_file.read_bytes(), before_key)
                 self.assertEqual(caption_settings.read_caption_settings(), before_private)
+
+    def test_local_settings_work_without_crypto_and_cloud_gives_install_message(self):
+        real_import = builtins.__import__
+
+        def without_crypto(name, *args, **kwargs):
+            if name.startswith("cryptography"):
+                raise ModuleNotFoundError("missing cryptography", name="cryptography")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=without_crypto):
+            self.assertEqual(caption_settings.public_caption_settings()["mode"], "local")
+            saved = caption_settings.save_caption_settings({"image_prompt": "本地自定义识别"})
+            self.assertEqual(saved["mode"], "local")
+            self.assertEqual(caption_settings.read_caption_settings()["image_prompt"], "本地自定义识别")
+            before = (self.config / "caption_settings.json").read_bytes()
+            with self.assertRaises(caption_settings.CaptionSettingsError) as error:
+                caption_settings.save_caption_settings({
+                    "base_url": "https://example.com", "model": "m", "api_key": "test-key",
+                })
+            self.assertIn("requirements.txt", str(error.exception))
+            self.assertEqual((self.config / "caption_settings.json").read_bytes(), before)
+            self.assertFalse((self.config / "caption_settings.key").exists())
+        caption_settings.save_caption_settings({
+            "base_url": "https://example.com", "model": "m", "api_key": "test-key",
+        })
+        with patch("builtins.__import__", side_effect=without_crypto):
+            with self.assertRaises(caption_settings.CaptionSettingsError) as error:
+                caption_settings.public_caption_settings()
+            self.assertIn("requirements.txt", str(error.exception))
 
     def test_corrupt_configuration_and_lost_key_fail_closed(self):
         self.config.mkdir()
