@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import dashboard
 from doubao_automation import caption_context, caption_settings
+from doubao_automation.caption_page import CaptionPageError, ProductPage
 from doubao_automation.caption_runtime import CaptionRuntimeError
 from doubao_automation.state import JsonStore
 
@@ -69,7 +70,7 @@ class CaptionApiTests(unittest.TestCase):
         self.assertEqual(row['caption_images'],[str(self.image)])
         self.assertEqual(row['caption_videos'],[{'index':0,'path':str(self.video)}])
         self.assertEqual(row['images'],[str(self.image)])
-        self.assertEqual(row['captions'],{'images':None,'video':None})
+        self.assertEqual(row['captions'],{'images':None,'video':None,'link':None})
         model=Mock(return_value='柔软玩具熊的近景。')
         response=self.generated(model)
         self.assertEqual(response.status_code,200,response.get_json())
@@ -289,6 +290,105 @@ class CaptionApiTests(unittest.TestCase):
             self.assertEqual(failed.json['code'], 'caption_cloud_error')
             self.assertEqual(self.store.snapshot(), before)
             local.assert_not_called()
+
+
+    def test_link_caption_combines_with_image_in_actual_gemini_preview(self):
+        url = 'https://products.example.com/item?tag=local-test'
+        payload = dict(record_id='fixture-record', url=url, revision=None)
+        endpoint = '/api/captions/link/generate'
+        with self.store.txn() as data:
+            data['fixed_prompt'] = '本次只写1个15秒的视频脚本。'
+        self.assertEqual(self.generated(Mock(return_value='图片是一只白色马克杯。')).status_code, 200)
+        self.assertEqual(self.client.post('/api/captions/settings',
+                                         json={'link_prompt': '提取公开规格与容量'}).status_code, 200)
+        self.assertEqual(dashboard.app.test_client().post(endpoint, json=payload).status_code, 403)
+        with patch('doubao_automation.caption_page.fetch_product_page',
+                   return_value=ProductPage(url, '马克杯', '容量 350 毫升。')) as fetch, \
+             patch('doubao_automation.caption_runtime.generate_page_caption',
+                   return_value='网页标注容量 350 毫升。') as model:
+            result = self.client.post(endpoint, json=payload)
+        self.assertEqual(result.status_code, 200, result.json)
+        fetch.assert_called_once_with(url)
+        model.assert_called_once_with('马克杯', '容量 350 毫升。', instructions='提取公开规格与容量')
+        saved = result.json['entry']
+        self.assertTrue(saved['enabled'])
+        self.assertEqual(self.new_client().get('/api/state').json['rows'][0]['captions']['link'], saved)
+        preview = self.client.post('/api/captions/preview', json={'record_id': 'fixture-record'})
+        self.assertEqual(preview.status_code, 200, preview.json)
+        self.assertIn('图片是一只白色马克杯。', preview.json['prompt'])
+        self.assertIn(saved['text'], preview.json['prompt'])
+        self.assertIn('本次最终只输出1个脚本', preview.json['prompt'])
+        self.assertNotIn(url, preview.json['prompt'])
+        disabled = self.client.post('/api/captions/link/save', json={
+            **payload, 'text': saved['text'], 'enabled': False, 'revision': saved['revision']})
+        self.assertEqual(disabled.status_code, 200, disabled.json)
+        preview = self.client.post('/api/captions/preview', json={'record_id': 'fixture-record'})
+        self.assertIn('图片是一只白色马克杯。', preview.json['prompt'])
+        self.assertNotIn(saved['text'], preview.json['prompt'])
+        self.assertEqual(self.store.snapshot()['tasks'][0]['status'], 'awaiting_result')
+
+    def test_link_cloud_uses_extracted_text_and_failures_preserve_previous_description(self):
+        endpoint = '/api/captions/link/generate'
+        url = 'https://products.example.com/item'
+        payload = dict(record_id='fixture-record', url=url, revision=None)
+        cloud = dict(base_url='https://vision.example.com/v1', model='vision', api_key='fixture-only-key')
+        self.assertEqual(self.client.post('/api/captions/settings',
+                                         json={**cloud, 'link_prompt': '提取明确规格'}).status_code, 200)
+        with patch('doubao_automation.caption_page.fetch_product_page',
+                   return_value=ProductPage(url + '/redirected', '杯子', '网页：350 毫升')) as fetch, \
+             patch('doubao_automation.caption_runtime.generate_page_caption') as local, \
+             patch('doubao_automation.caption_cloud.generate_cloud_page_caption',
+                   return_value='杯子容量 350 毫升。') as remote:
+            generated = self.client.post(endpoint, json=payload)
+            self.assertEqual(generated.status_code, 200, generated.json)
+            saved = generated.json['entry']
+            self.assertEqual(saved['url'], url)
+            remote.assert_called_once_with('杯子', '网页：350 毫升', instructions='提取明确规格', **cloud)
+            local.assert_not_called()
+            before = self.store.snapshot()
+            fetch.side_effect = CaptionPageError('商品页面拒绝访问')
+            blocked = self.client.post(endpoint, json={**payload, 'revision': saved['revision']})
+            self.assertEqual(blocked.status_code, 502, blocked.json)
+            self.assertEqual(blocked.json['code'], 'caption_page_unavailable')
+            remote.assert_called_once()
+            self.assertEqual(before, self.store.snapshot())
+
+    def test_link_conflict_protects_edits_and_rejects_private_url_before_fetch(self):
+        generate = '/api/captions/link/generate'
+        save = '/api/captions/link/save'
+        url = 'https://products.example.com/item'
+        payload = dict(record_id='fixture-record', url=url, revision=None)
+        edited = self.client.post(save, json={**payload, 'text': '保留人工描述。', 'enabled': True})
+        self.assertEqual(edited.status_code, 200, edited.json)
+        entry = edited.json['entry']
+        self.assertTrue(entry['edited'])
+        with patch('doubao_automation.caption_page.fetch_product_page',
+                   return_value=ProductPage(url, '杯子', '网页可见规格')) as fetch, \
+             patch('doubao_automation.caption_runtime.generate_page_caption', return_value='新候选。') as model:
+            denied = self.client.post(generate, json={**payload, 'url': 'http://127.0.0.1/'})
+            self.assertEqual(denied.status_code, 400, denied.json)
+            stale = self.client.post(generate, json=payload)
+            self.assertEqual(stale.status_code, 409, stale.json)
+            fetch.assert_not_called()
+            candidate = self.client.post(generate, json={**payload, 'revision': entry['revision']})
+            self.assertEqual(candidate.status_code, 200, candidate.json)
+            self.assertEqual(candidate.json, dict(entry=entry, candidate_text='新候选。', candidate_url=url))
+            before = self.store.snapshot()
+            with patch.dict(os.environ, {'DOUBAO_CONTAINER_PREVIEW': '1'}):
+                blocked = self.client.post(generate, json={**payload, 'revision': entry['revision']})
+            self.assertEqual(blocked.status_code, 501, blocked.json)
+            fetch.assert_called_once()
+            self.assertEqual(before, self.store.snapshot())
+
+            def reassign_product(*args, **kwargs):
+                with self.store.txn() as data:
+                    data['sources'][0]['keyword'] = 'different product'
+                return '描述属于已经更换的商品。'
+
+            model.side_effect = reassign_product
+            changed = self.client.post(generate, json={**payload, 'revision': entry['revision']})
+            self.assertEqual(changed.status_code, 409, changed.json)
+            self.assertIsNone(self.client.get('/api/state').json['rows'][0]['captions']['link'])
 
 
 if __name__=='__main__':unittest.main()

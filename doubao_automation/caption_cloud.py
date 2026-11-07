@@ -1,4 +1,4 @@
-"""Send selected local images or sampled frames to an OpenAI-compatible API."""
+"""Send selected media or extracted page evidence to an OpenAI-compatible API."""
 
 import base64
 import json
@@ -12,8 +12,11 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .caption_runtime import (
     CaptionRuntimeError,
+    MAX_PAGE_CAPTION_LENGTH,
     _custom_instructions,
     _media_paths,
+    _page_caption_messages,
+    _page_description,
     _video_frames,
     _video_tools,
     _visual_prompt,
@@ -94,11 +97,11 @@ def _status_error(status: int) -> CaptionRuntimeError:
     if status == 429:
         return CaptionRuntimeError("云端请求受频率或额度限制（HTTP 429）。")
     if status in (400, 413, 415, 422):
-        return CaptionRuntimeError(f"云端服务拒绝图片识别请求，请核对模型和素材格式（HTTP {status}）。")
+        return CaptionRuntimeError(f"云端服务拒绝识别请求，请核对模型和输入格式（HTTP {status}）。")
     return CaptionRuntimeError(f"云端识别服务请求失败（HTTP {status}）。")
 
 
-def _completion(request: Request, api_key: str) -> str:
+def _completion(request: Request, api_key: str, max_length: int) -> str:
     try:
         with build_opener(_NoRedirect()).open(request, timeout=_TIMEOUT) as response:
             data = response.read(_MAX_RESPONSE_BYTES + 1)
@@ -125,7 +128,25 @@ def _completion(request: Request, api_key: str) -> str:
             raise ValueError
     except (AttributeError, IndexError, KeyError, TypeError, ValueError, RecursionError):
         raise CaptionRuntimeError("云端模型没有返回可用的识别描述。") from None
-    return text[:240]
+    return text[:max_length]
+
+
+def _cloud_model_key(model: str, api_key: str) -> tuple[str, str]:
+    if not isinstance(model, str) or not model.strip() or len(model.strip()) > 256:
+        raise CaptionRuntimeError("请填写云端模型名称。")
+    if not isinstance(api_key, str) or not api_key.strip() or any(not 33 <= ord(c) <= 126 for c in api_key.strip()):
+        raise CaptionRuntimeError("请填写有效的云端 API Key。")
+    return model.strip(), api_key.strip()
+
+
+def _chat_request(endpoint: str, model: str, api_key: str, messages: list[dict], *, max_length: int) -> str:
+    payload = {"model": model, "messages": messages}
+    request = Request(endpoint, data=json.dumps(payload).encode("ascii"), method="POST", headers={
+        "Authorization": "Bearer " + api_key,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    })
+    return _completion(request, api_key, max_length)
 
 
 def generate_cloud_caption(
@@ -134,13 +155,9 @@ def generate_cloud_caption(
 ) -> str:
     """Describe saved media using an explicitly configured HTTPS provider."""
     endpoint = _chat_endpoint(base_url)
-    if not isinstance(model, str) or not model.strip() or len(model.strip()) > 256:
-        raise CaptionRuntimeError("请填写支持图片输入的云端模型名称。")
-    if not isinstance(api_key, str) or not api_key.strip() or any(not 33 <= ord(c) <= 126 for c in api_key.strip()):
-        raise CaptionRuntimeError("请填写有效的云端 API Key。")
-    api_key = api_key.strip()
+    model, api_key = _cloud_model_key(model, api_key)
     paths = _media_paths(paths, kind, role)
-    custom = _custom_instructions(kind, role, instructions)
+    custom = _custom_instructions("image_prompt" if kind == "images" else f"{role}_video_prompt", instructions)
     prompt = _visual_prompt(kind, role, custom, combined=True)
     if kind == "video":
         with tempfile.TemporaryDirectory(prefix="caption-frames-") as temp:
@@ -148,10 +165,16 @@ def generate_cloud_caption(
             images = _image_content(frames)
     else:
         images = _image_content(paths)
-    payload = {"model": model.strip(), "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}, *images]}]}
-    request = Request(endpoint, data=json.dumps(payload).encode("ascii"), method="POST", headers={
-        "Authorization": "Bearer " + api_key,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    })
-    return _completion(request, api_key)
+    messages = [{"role": "user", "content": [{"type": "text", "text": prompt}, *images]}]
+    return _chat_request(endpoint, model, api_key, messages, max_length=240)
+
+
+def generate_cloud_page_caption(
+    page_title: str, page_text: str, *, base_url: str, model: str, api_key: str, instructions: str | None = None,
+) -> str:
+    """Summarize public product evidence using the selected HTTPS model."""
+    endpoint = _chat_endpoint(base_url)
+    model, api_key = _cloud_model_key(model, api_key)
+    messages = _page_caption_messages(page_title, page_text, instructions)
+    description = _chat_request(endpoint, model, api_key, messages, max_length=MAX_PAGE_CAPTION_LENGTH)
+    return _page_description(description)

@@ -52,7 +52,27 @@ const context = vm.createContext({document:{querySelector:element,getElementById
       row.captions[kind] = {...fields,edited:true,revision:fields.revision+1};
       return reply({entry:row.captions[kind]});
     }
-    if (path === '/api/captions/preview') return reply({prompt:`${row.prompt}\n<实际拼接描述>`});
+    if (path === '/api/captions/link/generate') {
+      if (holdGenerate) { holdGenerate=false; await new Promise(resolve=>releaseGenerate=resolve); }
+      if (failGenerate) return {ok:false,status:503,json:async()=>({error:'无法读取产品页面'})};
+      const prior = row.captions.link;
+      assert.equal(body.revision,prior?.revision ?? null);
+      const text = '识别 <链接产品描述>';
+      const sameUrl = prior?.url === body.url;
+      if (sameUrl && prior.edited) return reply({entry:prior,candidate_text:text,candidate_url:body.url});
+      row.captions.link = {url:body.url,text,enabled:sameUrl ? prior.enabled : true,
+        edited:false,revision:(prior?.revision || 0)+1};
+      return reply({entry:row.captions.link});
+    }
+    if (path === '/api/captions/link/save') {
+      const {record_id,...fields} = body;
+      assert.equal(record_id,id);
+      assert.equal(fields.revision,row.captions.link.revision);
+      row.captions.link = {...fields,edited:true,revision:fields.revision+1};
+      return reply({entry:row.captions.link});
+    }
+    if (path === '/api/captions/preview') return reply({prompt:`${row.prompt}\n<实际拼接描述>`
+      + (row.captions.link?.enabled ? '\n'+row.captions.link.text : '')});
     throw Error('unexpected request '+path);
   },
 });
@@ -64,11 +84,13 @@ const control = (kind,properties={}) => ({...properties,dataset:properties.datas
   closest:selector=>selector==='[data-caption-row]'?{dataset:{captionRow:id}}:kind?panel(kind):null});
 const choose = (kind,choice,value)=>context.chooseCaption(control(kind,{dataset:{captionChoice:choice},value}));
 const input = (kind,field,properties)=>sourceRows.listeners.input({target:control(kind,{dataset:{captionField:field},...properties})});
-const images = control('images'), video = control('video'), preview = control(null);
+const link = control('link'), images = control('images'), video = control('video'), preview = control(null);
 const lastBody = route=>writes.filter(([path])=>path==='/api/captions/'+route).at(-1)?.[1];
 
 (async()=>{
   await context.refresh();
+  assert.match(sourceRows.innerHTML,/data-caption-kind="link".*data-caption-kind="images"/s);
+  assert.match(sourceRows.innerHTML,/onclick="generateLinkCaption\(this\)" disabled>一键识别链接/);
   assert.match(sourceRows.innerHTML,/一键识别图片/);
   assert.match(sourceRows.innerHTML,/一键识别视频/);
   assert.match(sourceRows.innerHTML,/当前产品整组（2 张）/);
@@ -146,5 +168,65 @@ const lastBody = route=>writes.filter(([path])=>path==='/api/captions/'+route).a
   failGenerate=true; await context.generateCaption(images);
   assert.match(mount.innerHTML,/识别服务暂不可用/);
   assert.equal(generateButton.disabled,false);
-  console.log('Caption UI: selected original indices, global busy, drafts, stale polling, candidate review, save and preview passed');
+
+  // Keep URLs and descriptions scoped to this row. Never fetch a draft URL
+  // while the user is typing or expose it as markup.
+  const url = 'https://products.example.com/item?sku=1&view=detail';
+  const nextUrl = 'https://products.example.com/another';
+  let before = writes.length;
+  input('link','url',{value:'"><img src=x>'});
+  await context.refresh();
+  assert.match(sourceRows.innerHTML,/value="&quot;&gt;&lt;img src=x&gt;"/);
+  input('link','url',{value:' '+url+' '});
+  await context.refresh();
+  assert.match(sourceRows.innerHTML,/sku=1&amp;view=detail/);
+  await context.previewCaption(preview);
+  await context.syncFeishu();
+  await context.run();
+  assert.equal(writes.length,before,'unsaved URL drafts block preview, sync and new run');
+
+  failGenerate=false;
+  holdGenerate=true;
+  const linking = context.generateLinkCaption(link);
+  assert.equal(generateButton.disabled,true);
+  await context.generateCaption(images);
+  assert.deepEqual(lastBody('link/generate'),{record_id:id,url,revision:null});
+  assert.equal(writes.length,before+1,'link recognition shares the media lock');
+  releaseGenerate(); await linking;
+  assert.match(mount.innerHTML,/识别 &lt;链接产品描述&gt;/);
+  assert.match(mount.innerHTML,/data-caption-kind="link".*?data-caption-field="enabled" checked/s);
+  await context.previewCaption(preview);
+  assert.match(mount.innerHTML,/<pre[^>]*>.*&lt;实际拼接描述&gt;\s+识别 &lt;链接产品描述&gt;/s);
+
+  input('link','text',{value:'人工编辑 <链接描述>'});
+  input('link','enabled',{checked:false});
+  input('link','url',{value:nextUrl});
+  await context.refresh();
+  assert.match(sourceRows.innerHTML,/人工编辑 &lt;链接描述&gt;/);
+  assert.match(sourceRows.innerHTML,/value="https:\/\/products\.example\.com\/another"/);
+  before = writes.length;
+  await context.generateLinkCaption(link);
+  assert.equal(writes.length,before,'save or restore edited description before recognition');
+  await context.saveLinkCaption(link);
+  assert.deepEqual(lastBody('link/save'),{record_id:id,url,text:'人工编辑 <链接描述>',enabled:false,revision:1},
+    'manually saving the existing description must not bind it to the newly pasted URL');
+  context.restoreLinkUrl(link);
+
+  await context.generateLinkCaption(link);
+  assert.equal(row.captions.link.text,'人工编辑 <链接描述>');
+  assert.match(mount.innerHTML,/新链接描述.*识别 &lt;链接产品描述&gt;/s);
+  await context.saveLinkCaption(link,true);
+  assert.deepEqual(lastBody('link/save'),{record_id:id,url,text:'识别 <链接产品描述>',enabled:false,revision:2});
+  await context.previewCaption(preview);
+  assert.doesNotMatch(mount.innerHTML,/<pre[^>]*>.*识别 &lt;链接产品描述&gt;/s);
+
+  input('link','url',{value:nextUrl});
+  failGenerate=true; await context.generateLinkCaption(link);
+  assert.match(mount.innerHTML,/无法读取产品页面/);
+  assert.match(mount.innerHTML,/value="https:\/\/products\.example\.com\/another"/);
+  assert.equal(row.captions.link.url,url);
+  failGenerate=false; await context.generateLinkCaption(link);
+  assert.deepEqual(lastBody('link/generate'),{record_id:id,url:nextUrl,revision:3});
+  assert.equal(row.captions.link.enabled,true,'new URL recognition is included by default');
+  console.log('Caption UI: media selection, link recognition, shared busy, draft persistence, candidate review, save and preview passed');
 })().catch(error=>{console.error(error);process.exitCode=1;});

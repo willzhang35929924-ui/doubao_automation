@@ -108,11 +108,33 @@ async function saveRows(show = true) {
   await refresh(); return result;
 }
 function captionView(row) {
-  if (!captionRows.has(row.record_id)) captionRows.set(row.record_id,{images:{},video:{}});
+  if (!captionRows.has(row.record_id)) captionRows.set(row.record_id,{link:{},images:{},video:{}});
   return captionRows.get(row.record_id);
 }
 function hasCaptionDrafts() {
-  return [...captionRows.values()].some(view => view.images.draft || view.video.draft);
+  return [...captionRows.values()].some(view => hasRowCaptionDraft(view));
+}
+function hasRowCaptionDraft(view) {
+  return Boolean(view.link.urlDraft || view.link.draft || view.images.draft || view.video.draft);
+}
+function renderLinkCaption(row, locked) {
+  const entry = row.captions?.link;
+  const {urlDraft,draft,candidate} = captionView(row).link;
+  const url = urlDraft?.url ?? entry?.url ?? '';
+  const unavailable = !url.trim();
+  const editor = entry ? `<p class="muted" style="overflow-wrap:anywhere">已保存链接 · ${esc(entry.url)}</p>
+    <label>链接描述<textarea data-caption-field="text">${esc(draft?.text ?? entry.text)}</textarea></label>
+    <label><input type="checkbox" style="width:auto" data-caption-field="enabled"${(draft?.enabled ?? entry.enabled) ? ' checked' : ''}> 带入最终提示词</label>
+    <div class="actions"><button type="button" class="btn gray" onclick="saveLinkCaption(this)">保存链接描述</button><button type="button" class="btn gray" onclick="discardCaption(this)">还原已保存描述</button></div>` : '';
+  const proposed = candidate ? `<p class="muted">已保留原人工编辑。可查看新识别结果后再决定是否采用。</p>
+    <p class="muted" style="overflow-wrap:anywhere">新识别链接 · ${esc(candidate.url)}</p>
+    <label>新链接描述<textarea readonly>${esc(candidate.text)}</textarea></label>
+    <div class="actions"><button type="button" class="btn gray" onclick="saveLinkCaption(this,true)">采用新描述</button><button type="button" class="btn gray" onclick="discardCaption(this,true)">保留原描述</button></div>` : '';
+  return `<fieldset class="row" data-caption-kind="link"${locked}><legend>链接识别</legend>
+    <label>产品页面链接<input type="url" data-caption-field="url" value="${esc(url)}" placeholder="https://…" spellcheck="false" autocomplete="off"></label>
+    <p class="muted">粘贴公开产品页链接，识别描述可与图片描述一起带入 Gemini 提示词。</p>
+    <div class="actions"><button type="button" class="btn gray" data-caption-generate data-caption-unavailable="${unavailable}" onclick="generateLinkCaption(this)"${captionRecognition || unavailable ? ' disabled' : ''}>一键识别链接</button>
+    <button type="button" class="btn gray" onclick="restoreLinkUrl(this)">${entry ? '还原已保存链接' : '清空链接'}</button></div>${editor}${proposed}</fieldset>`;
 }
 function captionSelection(row,kind) {
   const images = kind === 'images';
@@ -147,7 +169,7 @@ function renderCaptions(row) {
       <div class="actions"><label>识别${label} <select data-caption-choice="media" onchange="chooseCaption(this)"><option value=""${index === null ? ' selected' : ''}>${mediaLabel}</option>${options}</select></label>${roleChoice}
       <button class="btn gray" data-caption-generate data-caption-unavailable="${unavailable}" onclick="generateCaption(this)"${captionRecognition || unavailable ? ' disabled' : ''}>一键识别${label}</button></div>${editor}${proposed}</fieldset>`;
   }).join('');
-  return `${panels}<p class="muted" role="status" data-caption-busy>${captionRecognition ? '素材识别正在进行，请等待完成。' : ''}</p>
+  return `${renderLinkCaption(row,locked)}${panels}<p class="muted" role="status" data-caption-busy>${captionRecognition ? '素材识别正在进行，请等待完成。' : ''}</p>
     <button class="btn gray" onclick="previewCaption(this)"${locked}>预览最终提示词</button>
     <p class="muted" role="status" data-caption-feedback>${esc(view.pending || view.feedback || '')}</p>
     <pre class="log" data-caption-preview${view.preview ? '' : ' hidden'}>${esc(view.preview || '')}</pre>`;
@@ -185,11 +207,25 @@ function editCaption(target) {
   const context = captionContext(target);
   if (!context || !target.dataset.captionField) return;
   const {row,kind,view} = context, entry = row.captions?.[kind];
-  if (!entry || entry.stale) return;
-  const draft = view[kind].draft ??= {base:entry,text:entry.text,enabled:entry.enabled};
-  if (target.dataset.captionField === 'text') draft.text = target.value;
-  else draft.enabled = target.checked;
-  view.feedback = '描述有未保存修改';
+  const field = target.dataset.captionField, panel = view[kind];
+  if (kind === 'link' && field === 'url') {
+    if (target.value.trim() === (entry?.url ?? '')) delete panel.urlDraft;
+    else {
+      panel.urlDraft ??= {revision:entry?.revision ?? null};
+      panel.urlDraft.url = target.value;
+    }
+    const button = target.closest('[data-caption-kind]').querySelector('[data-caption-generate]');
+    const unavailable = !target.value.trim();
+    button.dataset.captionUnavailable = String(unavailable);
+    button.disabled = captionRecognition || unavailable;
+    view.feedback = panel.urlDraft ? '链接已修改，点击一键识别后保存链接和描述' : '';
+  } else {
+    if (!entry || entry.stale) return;
+    const draft = panel.draft ??= {base:entry,text:entry.text,enabled:entry.enabled};
+    if (field === 'text') draft.text = target.value;
+    else draft.enabled = target.checked;
+    view.feedback = '描述有未保存修改';
+  }
   const feedback = document.getElementById('captions-'+row.record_id)?.querySelector('[data-caption-feedback]');
   if (feedback) feedback.textContent = view.feedback;
   clearCaptionPreview(row);
@@ -221,6 +257,58 @@ function setCaptionRecognition(active) {
   for (const status of container.querySelectorAll('[data-caption-busy]')) {
     status.textContent = active ? '素材识别正在进行，请等待完成。' : '';
   }
+}
+function restoreLinkUrl(target) {
+  const context = captionContext(target);
+  if (!context || context.view.pending) return;
+  const {row,view} = context;
+  delete view.link.urlDraft;
+  view.feedback = row.captions?.link ? '已还原至上次保存的链接' : '已清空链接';
+  updateCaptionRow(row);
+}
+async function generateLinkCaption(target) {
+  const context = captionContext(target);
+  if (!context || context.view.pending || captionRecognition) return;
+  const {row,view} = context, panel = view.link, entry = row.captions?.link;
+  if (dirty || panel.draft) {
+    view.feedback = dirty ? '请先保存原提示词修改，再识别链接' : '请先保存或还原链接描述，再重新识别';
+    updateCaptionRow(row); return;
+  }
+  const url = (panel.urlDraft?.url ?? entry?.url ?? '').trim();
+  if (!url) return;
+  const revision = panel.urlDraft ? panel.urlDraft.revision : entry?.revision ?? null;
+  setCaptionRecognition(true);
+  try {
+    await captionAction(row,'正在读取页面并识别链接，请等待完成…',async () => {
+      const result = await api('/api/captions/link/generate',{record_id:row.record_id,url,revision});
+      (row.captions ??= {}).link = result.entry;
+      delete panel.urlDraft;
+      clearCaptionPreview(row);
+      if (typeof result.candidate_text === 'string') {
+        panel.candidate = {text:result.candidate_text,base:result.entry,url:result.candidate_url ?? url};
+        return '链接已识别，原人工编辑已保留';
+      }
+      delete panel.candidate;
+      return result.entry.enabled ? '链接描述已保存，将带入最终提示词' : '链接描述已保存，当前未带入最终提示词';
+    });
+  } finally { setCaptionRecognition(false); }
+}
+async function saveLinkCaption(target, useCandidate = false) {
+  const context = captionContext(target);
+  if (!context) return;
+  const {row,view} = context, panel = view.link, entry = row.captions?.link;
+  const selected = useCandidate ? panel.candidate : panel.draft;
+  if (!entry || !selected) return;
+  const {base,text} = selected;
+  await captionAction(row,'正在保存链接描述…',async () => {
+    const result = await api('/api/captions/link/save',{record_id:row.record_id,text,
+      url:useCandidate ? selected.url : base.url,revision:base.revision,
+      enabled:useCandidate ? (panel.draft?.enabled ?? entry.enabled) : selected.enabled});
+    row.captions.link = result.entry;
+    delete panel.draft; delete panel.candidate;
+    clearCaptionPreview(row);
+    return '链接描述已保存';
+  });
 }
 async function generateCaption(target) {
   const context = captionContext(target);
@@ -268,7 +356,7 @@ async function previewCaption(target) {
   const context = captionContext(target);
   if (!context || context.view.pending) return;
   const {row,view} = context;
-  if (dirty || view.images.draft || view.video.draft) {
+  if (dirty || hasRowCaptionDraft(view)) {
     view.feedback = '请先保存原提示词及素材描述的修改，再预览';
     updateCaptionRow(row); return;
   }
@@ -280,7 +368,7 @@ async function previewCaption(target) {
     return '已显示最终提示词预览';
   });
 }
-const captionModelFields = ['base_url','model','image_prompt','product_video_prompt','reference_video_prompt'];
+const captionModelFields = ['base_url','model','link_prompt','image_prompt','product_video_prompt','reference_video_prompt'];
 let captionModelDialog, captionModelSettings, captionModelLoading = 0, captionModelSaving = false;
 
 function createCaptionModelDialog() {
@@ -289,7 +377,7 @@ function createCaptionModelDialog() {
   dialog.style.cssText = 'width:min(680px,calc(100% - 24px));max-height:calc(100vh - 24px);border:1px solid #d2d2d7;border-radius:16px;padding:20px';
   dialog.innerHTML = `<h2 id="caption-model-title">识别模型设置</h2>
     <p data-model-mode class="muted"></p>
-    <p class="muted">地址、模型名称或 API Key 缺少任一项时，使用本地分析。三项齐备后，识别会将图片或视频抽帧发送至你配置的 HTTPS OpenAI 兼容 API。</p>
+    <p class="muted">地址、模型名称或 API Key 缺少任一项时，使用本地分析。三项齐备后，识别会将提取的页面文字、图片或视频抽帧发送至你配置的 HTTPS OpenAI 兼容 API。</p>
     <form>
       <fieldset style="border:0;padding:0;margin:0" disabled>
         <label>API 地址 <input name="base_url" type="url" placeholder="https://api.example.com/v1" spellcheck="false" autocomplete="off"></label>
@@ -297,6 +385,7 @@ function createCaptionModelDialog() {
         <label>API Key <input name="api_key" type="password" autocomplete="new-password" aria-describedby="caption-model-key-note"></label>
         <p id="caption-model-key-note" class="muted"></p>
         <label><input name="clear_api_key" type="checkbox" style="width:auto"> 清除已保存的 API Key</label>
+        <p><label>识别链接提示词 <textarea name="link_prompt"></textarea></label></p>
         <p><label>图片识别提示词 <textarea name="image_prompt"></textarea></label></p>
         <p><label>商品实拍视频提示词 <textarea name="product_video_prompt"></textarea></label></p>
         <p><label>创意参考视频提示词 <textarea name="reference_video_prompt"></textarea></label></p>

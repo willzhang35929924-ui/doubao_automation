@@ -21,7 +21,8 @@ dialog.showModal = () => { dialog.open=true; };
 dialog.close = () => { dialog.open=false; dialog.events.close(); };
 inDialog('form').elements = {namedItem:field};
 const saved = {base_url:'https://api.example.com/v1',model:'vision-fixture',api_key_configured:true,
-  api_key_mask:'****',mode:'cloud',image_prompt:'<图片提示>',product_video_prompt:'商品提示',reference_video_prompt:'创意提示'};
+  api_key_mask:'****',mode:'cloud',link_prompt:'<链接提示>',image_prompt:'<图片提示>',
+  product_video_prompt:'商品提示',reference_video_prompt:'创意提示'};
 const writes = [];
 let appended = 0, failLoad = false, holdSave = false, releaseSave, failSave = false;
 const ok = settings => ({ok:true,json:async()=>structuredClone(settings)});
@@ -57,18 +58,22 @@ const submit = () => form.events.submit({currentTarget:form,preventDefault(){}})
   assert.equal(dialog.attributes['aria-labelledby'],'caption-model-title');
   assert.match(dialog.innerHTML,/type="password"/);
   assert.match(dialog.innerHTML,/视频抽帧发送至你配置的 HTTPS OpenAI 兼容 API/);
+  assert.match(dialog.innerHTML,/识别链接提示词 <textarea name="link_prompt">/);
+  assert.equal(field('link_prompt').value,'<链接提示>');
   assert.equal(field('image_prompt').value,'<图片提示>');
   assert.equal(field('api_key').value,'');
   assert.match(keyNote.textContent,/\*\*\*\*/);
   assert.match(mode.textContent,/云端识别/);
 
   field('base_url').value=' HTTPS://API.EXAMPLE.COM/v1/ ';
+  field('link_prompt').value='自定义产品页面识别提示';
   field('image_prompt').value='自定义图片提示';
   field('product_video_prompt').value='自定义实拍提示';
   field('reference_video_prompt').value='自定义参考提示';
   await submit();
   assert.deepEqual(writes.at(-1),{base_url:'https://api.example.com/v1',model:'vision-fixture',
-    image_prompt:'自定义图片提示',product_video_prompt:'自定义实拍提示',reference_video_prompt:'自定义参考提示'});
+    link_prompt:'自定义产品页面识别提示',image_prompt:'自定义图片提示',
+    product_video_prompt:'自定义实拍提示',reference_video_prompt:'自定义参考提示'});
   assert.match(feedback.textContent,/已保存/);
 
   field('base_url').value='https://other.example.com/v1';
@@ -116,6 +121,7 @@ const submit = () => form.events.submit({currentTarget:form,preventDefault(){}})
   close.events.click();
   failLoad=false; await context.openCaptionModelSettings();
   assert.equal(appended,1);
+  assert.equal(field('link_prompt').value,'自定义产品页面识别提示');
   assert.equal(field('reference_video_prompt').value,'自定义参考提示');
   assert.equal(field('api_key').value,'');
   console.log('Caption model settings UI: masked key, provider binding, explicit clear, persisted prompts, load/save errors and dialog lifecycle passed');

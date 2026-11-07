@@ -24,6 +24,7 @@ class CaptionSettingsTests(unittest.TestCase):
         self.defaults = {
             "image_prompt": "默认图片识别", "product_video_prompt": "默认商品视频识别",
             "reference_video_prompt": "默认创意视频识别",
+            "link_prompt": "默认商品链接识别",
         }
         default_patch = patch.object(caption_runtime, "DEFAULT_CAPTION_PROMPTS", self.defaults, create=True)
         default_patch.start()
@@ -52,6 +53,26 @@ class CaptionSettingsTests(unittest.TestCase):
         if os.name != "nt":
             self.assertEqual(stat.S_IMODE(key_file.stat().st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(settings_file.stat().st_mode), 0o600)
+
+    def test_existing_cloud_settings_backfill_link_prompt_and_keep_key(self):
+        caption_settings.save_caption_settings({
+            "base_url": "https://example.com/v1", "model": "m", "api_key": "private-key",
+        })
+        path = self.config / "caption_settings.json"
+        legacy = json.loads(path.read_text())
+        del legacy["link_prompt"]
+        path.write_text(json.dumps(legacy), encoding="utf-8")
+        public = caption_settings.public_caption_settings()
+        self.assertEqual(public["mode"], "cloud")
+        self.assertEqual(public["link_prompt"], self.defaults["link_prompt"])
+        self.assertEqual(public["api_key_mask"], "****")
+
+        changed = caption_settings.save_caption_settings({"link_prompt": "列出网页明确写出的型号"})
+        self.assertEqual(changed["link_prompt"], "列出网页明确写出的型号")
+        self.assertEqual(json.loads(path.read_text())["link_prompt"], changed["link_prompt"])
+        self.assertEqual(caption_settings.read_caption_settings()["api_key"], "private-key")
+        reset = caption_settings.save_caption_settings({"link_prompt": " "})
+        self.assertEqual(reset["link_prompt"], self.defaults["link_prompt"])
 
     def test_same_address_blank_key_preserves_and_new_address_clears(self):
         caption_settings.save_caption_settings({
@@ -127,6 +148,7 @@ class CaptionSettingsTests(unittest.TestCase):
             {"image_prompt": "p" * (caption_runtime.MAX_CAPTION_PROMPT_LENGTH + 1)},
             {"product_video_prompt": "p" * (caption_runtime.MAX_CAPTION_PROMPT_LENGTH + 1)},
             {"reference_video_prompt": "p" * (caption_runtime.MAX_CAPTION_PROMPT_LENGTH + 1)},
+            {"link_prompt": "p" * (caption_runtime.MAX_CAPTION_PROMPT_LENGTH + 1)},
             {"api_key": "bad key"},
             {"api_key": "中文密钥"},
         ):

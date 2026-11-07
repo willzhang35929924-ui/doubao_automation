@@ -22,7 +22,8 @@ from doubao_automation.orchestrator import Pipeline
 from doubao_automation.config import DEFAULT_CONFIG_PATH, load_config, require_doubao_accounts, save_config
 from doubao_automation.doubao_login import probe_doubao_login, session_pages
 from doubao_automation.caption_context import (caption_source, caption_images, caption_videos, caption_target,
-                                               caption_entry, row_captions, put_caption)
+                                               caption_entry, row_captions, put_caption, link_caption,
+                                               link_caption_binding, put_link_caption, MAX_DESCRIPTION)
 from doubao_automation.feishu_client import FeishuClient
 from doubao_automation.windows_shell import open_video_folder
 from doubao_automation import postprocess
@@ -65,7 +66,7 @@ def enforce_local_request():
     if (os.environ.get('DOUBAO_CONTAINER_PREVIEW') == '1'
             and request.method not in ('GET', 'HEAD')
             and request.path in {'/api/run', '/api/accounts/add', '/api/accounts/open', '/api/accounts/visit',
-                                 '/api/captions/generate',
+                                 '/api/captions/generate', '/api/captions/link/generate',
                                  '/api/open-video', '/api/videos/approve'}):
         return jsonify(error='容器预览版不支持启动浏览器、桌面操作或视频后处理',
                        code='container_unsupported'), 501
@@ -249,7 +250,7 @@ def state():
                           'images':images_by_keyword.get(s.get('keyword',''),[]),
                           'caption_images':caption_images(d,s),
                           'caption_videos':caption_videos(s),
-                          'captions':row_captions(d,s)} for s in sources])
+                          'captions':{'link':None, **row_captions(d,s)}} for s in sources])
 
 
 def sync_report(stats,products,sources,visible,restored):
@@ -504,6 +505,113 @@ def caption_preview():
     except RuntimeError as exc:
         return jsonify(error=str(exc)),400
     return jsonify(prompt=format_gemini_request(prompt)[0])
+
+
+def _link_caption_request():
+    from doubao_automation.caption_page import normalize_page_url
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        raise ValueError('请求内容必须是 JSON 对象')
+    record_id, revision = body.get('record_id'), body.get('revision')
+    if (not isinstance(record_id, str) or not record_id.strip()
+            or (revision is not None and (not isinstance(revision, str) or not revision))):
+        raise ValueError('素材记录或链接描述版本无效')
+    return body, record_id, normalize_page_url(body.get('url')), revision
+
+
+def _link_caption_for(snapshot, record_id, revision):
+    source = _caption_saved_source(snapshot, record_id)
+    entry = link_caption(snapshot, source)
+    if (entry['revision'] if entry else None) != revision:
+        raise CaptionConflict('链接描述已被修改，请刷新后重试')
+    return source, entry
+
+
+@app.post('/api/captions/link/generate')
+def caption_link_generate():
+    from doubao_automation.caption_cloud import generate_cloud_page_caption
+    from doubao_automation.caption_page import CaptionPageError, fetch_product_page
+    from doubao_automation.caption_runtime import CaptionRuntimeError, generate_page_caption
+    from doubao_automation.caption_settings import read_caption_settings
+
+    _, record_id, url, revision = _link_caption_request()
+    if not caption_model_lock.acquire(blocking=False):
+        raise CaptionConflict('另一条素材正在识别，请等待完成')
+    try:
+        with lock:
+            require_idle()
+            snapshot = store().snapshot()
+            source, saved = _link_caption_for(snapshot, record_id, revision)
+            binding = link_caption_binding(snapshot, source)
+            settings = read_caption_settings()
+        try:
+            page = fetch_product_page(url)
+        except CaptionPageError as exc:
+            return jsonify(error=str(exc), code='caption_page_unavailable'), 502
+        except Exception as exc:
+            app.logger.error('读取商品页面失败: %s', type(exc).__name__)
+            return jsonify(error='无法读取商品页面，请检查链接后重试', code='caption_page_unavailable'), 502
+
+        cloud = {name: settings[name] for name in ('base_url', 'model', 'api_key')}
+        use_cloud = all(cloud.values())
+        instructions = settings['link_prompt']
+        try:
+            if use_cloud:
+                candidate = generate_cloud_page_caption(page.title, page.text, instructions=instructions, **cloud)
+            else:
+                candidate = generate_page_caption(page.title, page.text, instructions=instructions)
+        except CaptionRuntimeError as exc:
+            if use_cloud:
+                return jsonify(error=str(exc), code='caption_cloud_error'), 502
+            return jsonify(error=str(exc), code='caption_runtime_unavailable'), 503
+        except RuntimeError as exc:
+            app.logger.error('链接识别模型推理失败: %s', type(exc).__name__)
+            return jsonify(error='链接识别失败，请查看本机服务日志后重试'), 502
+        if not isinstance(candidate, str) or not candidate.strip():
+            return jsonify(error='识别模型没有返回有效的商品描述'), 502
+        candidate = candidate.strip()
+        same_link = saved and saved['url'] == url
+        with lock:
+            require_idle()
+            snapshot = store().snapshot()
+            try:
+                current_source, _ = _link_caption_for(snapshot, record_id, revision)
+            except ValueError:
+                raise CaptionConflict('素材记录已变化，请刷新后重试') from None
+            if link_caption_binding(snapshot, current_source) != binding:
+                raise CaptionConflict('素材所属商品已变化，请刷新后重试')
+            if same_link and saved['edited']:
+                return jsonify(entry=saved, candidate_text=candidate, candidate_url=url)
+            with store().txn() as data:
+                current_source, _ = _link_caption_for(data, record_id, revision)
+                if link_caption_binding(data, current_source) != binding:
+                    raise CaptionConflict('素材所属商品已变化，请刷新后重试')
+                entry = put_link_caption(data, current_source, url, candidate,
+                                         enabled=saved['enabled'] if same_link else True)
+        return jsonify(entry=entry)
+    finally:
+        caption_model_lock.release()
+
+
+@app.post('/api/captions/link/save')
+def caption_link_save():
+    body, record_id, url, revision = _link_caption_request()
+    text, enabled = body.get('text'), body.get('enabled')
+    if (not isinstance(text, str) or len(text.strip()) > MAX_DESCRIPTION
+            or not isinstance(enabled, bool) or (enabled and not text.strip())):
+        raise ValueError('链接描述或带入提示词的状态无效')
+    try:
+        text.encode('utf-8')
+    except UnicodeError:
+        raise ValueError('链接描述包含无效文本字符') from None
+    with lock:
+        require_idle()
+        with store().txn() as data:
+            source, _ = _link_caption_for(data, record_id, revision)
+            entry = put_link_caption(data, source, url, text.strip(), enabled=enabled, edited=True)
+    return jsonify(entry=entry)
+
 
 @app.post('/api/rows/delete')
 def row_delete():

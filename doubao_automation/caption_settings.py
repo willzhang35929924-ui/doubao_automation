@@ -14,7 +14,7 @@ from .paths import CONFIG_DIR
 _SETTINGS_NAME = "caption_settings.json"
 _KEY_NAME = "caption_settings.key"
 _LOCK = threading.RLock()
-_PROMPT_KEYS = ("image_prompt", "product_video_prompt", "reference_video_prompt")
+_PROMPT_KEYS = ("image_prompt", "product_video_prompt", "reference_video_prompt", "link_prompt")
 
 
 class CaptionSettingsError(ValueError):
@@ -105,6 +105,7 @@ def _load():
         stored = json.loads(settings_path.read_text(encoding="utf-8"))
         if not isinstance(stored, dict) or stored.get("version") != 1:
             raise ValueError
+        stored.setdefault("link_prompt", defaults["link_prompt"])
         for name in ("base_url", "model", *_PROMPT_KEYS):
             if not isinstance(stored.get(name), str):
                 raise ValueError

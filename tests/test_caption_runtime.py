@@ -24,6 +24,22 @@ class TestCaptionSetup(unittest.TestCase):
                 with self.assertRaisesRegex(runtime.CaptionRuntimeError, "scripts/setup_caption_runtime.sh"):
                     runtime.generate_caption([media], "images", "product")
 
+    def test_page_caption_uses_text_only_offline_worker(self):
+        with (
+            patch.object(runtime, "_local_model", return_value=(Path("/fixture/python"), Path("/fixture/model"))),
+            patch.object(runtime, "_run_worker", return_value={"caption": "红色水杯"}) as worker,
+        ):
+            actual = runtime.generate_page_caption("商品水杯", "红色水杯", instructions="重点描述颜色")
+        self.assertEqual(actual, "红色水杯")
+        python, request = worker.call_args.args
+        self.assertEqual(python, Path("/fixture/python"))
+        self.assertEqual(set(request), {"kind", "model", "messages"})
+        self.assertEqual(request["kind"], "page")
+        system, user = request["messages"]
+        self.assertEqual((system["role"], user["role"]), ("system", "user"))
+        self.assertIn("重点描述颜色", system["content"])
+        self.assertIn("红色水杯", user["content"])
+
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires local FFmpeg tools")
 class TestCaptionVideoFrames(unittest.TestCase):
