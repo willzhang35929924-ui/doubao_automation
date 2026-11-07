@@ -124,7 +124,6 @@ function renderLinkCaption(row, locked) {
   const unavailable = !url.trim();
   const editor = entry ? `<p class="muted" style="overflow-wrap:anywhere">已保存链接 · ${esc(entry.url)}</p>
     <label>链接描述<textarea data-caption-field="text">${esc(draft?.text ?? entry.text)}</textarea></label>
-    <label><input type="checkbox" style="width:auto" data-caption-field="enabled"${(draft?.enabled ?? entry.enabled) ? ' checked' : ''}> 带入最终提示词</label>
     <div class="actions"><button type="button" class="btn gray" onclick="saveLinkCaption(this)">保存链接描述</button><button type="button" class="btn gray" onclick="discardCaption(this)">还原已保存描述</button></div>` : '';
   const proposed = candidate ? `<p class="muted">已保留原人工编辑。可查看新识别结果后再决定是否采用。</p>
     <p class="muted" style="overflow-wrap:anywhere">新识别链接 · ${esc(candidate.url)}</p>
@@ -289,7 +288,7 @@ async function generateLinkCaption(target) {
         return '链接已识别，原人工编辑已保留';
       }
       delete panel.candidate;
-      return result.entry.enabled ? '链接描述已保存，将带入最终提示词' : '链接描述已保存，当前未带入最终提示词';
+      return '链接描述已保存，将带入最终提示词';
     });
   } finally { setCaptionRecognition(false); }
 }
@@ -303,7 +302,7 @@ async function saveLinkCaption(target, useCandidate = false) {
   await captionAction(row,'正在保存链接描述…',async () => {
     const result = await api('/api/captions/link/save',{record_id:row.record_id,text,
       url:useCandidate ? selected.url : base.url,revision:base.revision,
-      enabled:useCandidate ? (panel.draft?.enabled ?? entry.enabled) : selected.enabled});
+      enabled:true});
     row.captions.link = result.entry;
     delete panel.draft; delete panel.candidate;
     clearCaptionPreview(row);

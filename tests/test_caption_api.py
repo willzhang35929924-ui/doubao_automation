@@ -322,9 +322,10 @@ class CaptionApiTests(unittest.TestCase):
         disabled = self.client.post('/api/captions/link/save', json={
             **payload, 'text': saved['text'], 'enabled': False, 'revision': saved['revision']})
         self.assertEqual(disabled.status_code, 200, disabled.json)
+        self.assertTrue(disabled.json['entry']['enabled'])
         preview = self.client.post('/api/captions/preview', json={'record_id': 'fixture-record'})
         self.assertIn('图片是一只白色马克杯。', preview.json['prompt'])
-        self.assertNotIn(saved['text'], preview.json['prompt'])
+        self.assertIn(saved['text'], preview.json['prompt'])
         self.assertEqual(self.store.snapshot()['tasks'][0]['status'], 'awaiting_result')
 
     def test_link_cloud_uses_extracted_text_and_failures_preserve_previous_description(self):

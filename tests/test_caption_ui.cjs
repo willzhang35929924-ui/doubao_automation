@@ -60,7 +60,7 @@ const context = vm.createContext({document:{querySelector:element,getElementById
       const text = '识别 <链接产品描述>';
       const sameUrl = prior?.url === body.url;
       if (sameUrl && prior.edited) return reply({entry:prior,candidate_text:text,candidate_url:body.url});
-      row.captions.link = {url:body.url,text,enabled:sameUrl ? prior.enabled : true,
+      row.captions.link = {url:body.url,text,enabled:true,
         edited:false,revision:(prior?.revision || 0)+1};
       return reply({entry:row.captions.link});
     }
@@ -72,7 +72,7 @@ const context = vm.createContext({document:{querySelector:element,getElementById
       return reply({entry:row.captions.link});
     }
     if (path === '/api/captions/preview') return reply({prompt:`${row.prompt}\n<实际拼接描述>`
-      + (row.captions.link?.enabled ? '\n'+row.captions.link.text : '')});
+      + (row.captions.link ? '\n'+row.captions.link.text : '')});
     throw Error('unexpected request '+path);
   },
 });
@@ -194,12 +194,12 @@ const lastBody = route=>writes.filter(([path])=>path==='/api/captions/'+route).a
   assert.equal(writes.length,before+1,'link recognition shares the media lock');
   releaseGenerate(); await linking;
   assert.match(mount.innerHTML,/识别 &lt;链接产品描述&gt;/);
-  assert.match(mount.innerHTML,/data-caption-kind="link".*?data-caption-field="enabled" checked/s);
+  assert.doesNotMatch(mount.innerHTML.split('data-caption-kind="images"')[0],
+    /data-caption-field="enabled"|带入最终提示词/);
   await context.previewCaption(preview);
   assert.match(mount.innerHTML,/<pre[^>]*>.*&lt;实际拼接描述&gt;\s+识别 &lt;链接产品描述&gt;/s);
 
   input('link','text',{value:'人工编辑 <链接描述>'});
-  input('link','enabled',{checked:false});
   input('link','url',{value:nextUrl});
   await context.refresh();
   assert.match(sourceRows.innerHTML,/人工编辑 &lt;链接描述&gt;/);
@@ -208,7 +208,7 @@ const lastBody = route=>writes.filter(([path])=>path==='/api/captions/'+route).a
   await context.generateLinkCaption(link);
   assert.equal(writes.length,before,'save or restore edited description before recognition');
   await context.saveLinkCaption(link);
-  assert.deepEqual(lastBody('link/save'),{record_id:id,url,text:'人工编辑 <链接描述>',enabled:false,revision:1},
+  assert.deepEqual(lastBody('link/save'),{record_id:id,url,text:'人工编辑 <链接描述>',enabled:true,revision:1},
     'manually saving the existing description must not bind it to the newly pasted URL');
   context.restoreLinkUrl(link);
 
@@ -216,9 +216,9 @@ const lastBody = route=>writes.filter(([path])=>path==='/api/captions/'+route).a
   assert.equal(row.captions.link.text,'人工编辑 <链接描述>');
   assert.match(mount.innerHTML,/新链接描述.*识别 &lt;链接产品描述&gt;/s);
   await context.saveLinkCaption(link,true);
-  assert.deepEqual(lastBody('link/save'),{record_id:id,url,text:'识别 <链接产品描述>',enabled:false,revision:2});
+  assert.deepEqual(lastBody('link/save'),{record_id:id,url,text:'识别 <链接产品描述>',enabled:true,revision:2});
   await context.previewCaption(preview);
-  assert.doesNotMatch(mount.innerHTML,/<pre[^>]*>.*识别 &lt;链接产品描述&gt;/s);
+  assert.match(mount.innerHTML,/<pre[^>]*>.*识别 &lt;链接产品描述&gt;/s);
 
   input('link','url',{value:nextUrl});
   failGenerate=true; await context.generateLinkCaption(link);

@@ -151,7 +151,7 @@ def link_caption(snapshot, source):
     if (not entry['url'] or not entry['revision']
             or any(type(entry.get(field)) is not bool for field in ('enabled', 'edited'))):
         return None
-    return {field: entry[field] for field in ('url', 'text', 'revision', 'enabled', 'edited')}
+    return {field: entry[field] for field in ('url', 'text', 'revision', 'edited')} | {'enabled': True}
 
 
 def put_link_caption(snapshot, source, url, text, *, enabled=True, edited=False):
@@ -168,7 +168,7 @@ def put_link_caption(snapshot, source, url, text, *, enabled=True, edited=False)
     except UnicodeError:
         raise ValueError('链接地址或识别描述包含无效字符') from None
     key, fingerprint = link_caption_binding(snapshot, source)
-    entry = dict(url=url.strip(), text=text.strip(), enabled=enabled, edited=edited,
+    entry = dict(url=url.strip(), text=text.strip(), enabled=True, edited=edited,
                  revision=uuid.uuid4().hex)
     snapshot.setdefault('captions', {})[key] = dict(entry, fingerprint=fingerprint)
     return entry

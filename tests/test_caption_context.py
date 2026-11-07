@@ -112,8 +112,11 @@ class CaptionContextTests(unittest.TestCase):
                                                 enabled=False, edited=True)
         self.assertNotEqual(original['revision'], replacement['revision'])
         self.assertTrue(replacement['edited'])
+        self.assertTrue(replacement['enabled'])
+        key, _ = captions.link_caption_binding(self.snapshot, self.source)
+        self.snapshot['captions'][key]['enabled'] = False  # An older saved setting.
         self.assertEqual(captions.link_caption(self.snapshot, self.source), replacement)
-        self.assertEqual(build_script_prompt(self.cfg, self.snapshot, self.source), self.source['prompt_text'])
+        self.assertIn(replacement['text'], build_script_prompt(self.cfg, self.snapshot, self.source))
 
     def test_link_evidence_expires_when_sync_reassigns_the_product_record(self):
         url = 'https://shop.example.test/item'
